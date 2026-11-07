@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spec to Plan"
+  short_description: "Turn specs into implementation plans"
+  default_prompt: "Use $spec-to-plan to create an implementation plan from this spec file."
