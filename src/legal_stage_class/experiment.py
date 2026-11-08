@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 import uuid
 from collections import defaultdict
@@ -12,6 +13,7 @@ from typing import Any
 
 from .artifacts import write_run
 from .data import load_dataset
+from .embedding_cache import EmbeddingCache, corpus_cache_identity
 from .metrics import evaluate
 from .providers import Jev, ProviderLedger, SiliconFlow
 from .retrieval import BM25, cosine_topk, rrf
@@ -31,6 +33,7 @@ class RunOptions:
     max_laws: int = 20
     jev_batch_size: int = 32
     pre_cost_ceiling_usd: float = 20.0
+    cache_root: Path = Path(".cache/legal-stage-class")
 
 
 def _qrel_map(rows: list[dict[str, Any]]) -> dict[str, set[str]]:
@@ -50,6 +53,11 @@ def _select_laws(scores: dict[str, float], threshold: float, minimum: int, maxim
 
 
 class ExperimentRunner:
+    def __init__(self) -> None:
+        # This cache exists only for one process (not on disk). It lets the
+        # three independent acceptance arms use the same frozen corpus index.
+        self._corpus_vectors: dict[str, list[list[float]]] = {}
+
     def run(self, dataset_path: Path, options: RunOptions) -> Path:
         if options.strategy not in {"baseline_hybrid", "jev_pre_route", "jev_post_rerank"}:
             raise ValueError("strategy must be baseline_hybrid, jev_pre_route, or jev_post_rerank")
@@ -61,6 +69,7 @@ class ExperimentRunner:
         if missing:
             raise ValueError(f"unknown query ids: {sorted(missing)}")
         queries = [query_by_id[query_id] for query_id in options.query_ids]
+        print(f"[run] {options.strategy}: {len(queries)} queries; loading BM25 and Dense index", file=sys.stderr, flush=True)
         ledger = ProviderLedger()
         allowed: dict[str, set[str]] = {}
         route_info: dict[str, Any] = {}
@@ -104,16 +113,35 @@ class ExperimentRunner:
 
         bm25 = BM25(dataset["corpus"])
         siliconflow = SiliconFlow(ledger)
-        corpus_start = time.perf_counter()
-        corpus_vectors = siliconflow.embed([f"{row['name']}\n{row['content']}" for row in dataset["corpus"]], "dense_corpus_embedding")
-        corpus_embedding_ms = (time.perf_counter() - corpus_start) * 1000
+        cache_key, cache_identity = corpus_cache_identity(
+            dataset["dataset_hash"], dataset["corpus"], endpoint=siliconflow.endpoint, model=siliconflow.model,
+        )
+        cache = EmbeddingCache(options.cache_root)
+        corpus_vectors = self._corpus_vectors.get(cache_key)
+        memory_hit = corpus_vectors is not None
+        if corpus_vectors is None:
+            corpus_vectors = cache.load(cache_key, cache_identity, len(dataset["corpus"]))
+        disk_hit = corpus_vectors is not None and not memory_hit
+        if corpus_vectors is None:
+            corpus_start = time.perf_counter()
+            corpus_vectors = siliconflow.embed([f"{row['name']}\n{row['content']}" for row in dataset["corpus"]], "dense_corpus_embedding")
+            corpus_embedding_ms = (time.perf_counter() - corpus_start) * 1000
+            cache.store(cache_key, cache_identity, corpus_vectors)
+            self._corpus_vectors[cache_key] = corpus_vectors
+            corpus_embedding_source = "live"
+        else:
+            self._corpus_vectors[cache_key] = corpus_vectors
+            corpus_embedding_ms = 0.0
+            corpus_embedding_source = "disk_cache" if disk_hit else "in_memory_reuse"
+            print("[run] reusing cached corpus embeddings", file=sys.stderr, flush=True)
         article_by_id = {row["article_id"]: row for row in dataset["corpus"]}
         rankings_rows: list[dict[str, Any]] = []
         latency_rows: list[dict[str, Any]] = []
         ranking_ids: dict[str, list[str]] = {}
         shortlists: dict[str, list[str]] = {}
-        for query in queries:
+        for query_number, query in enumerate(queries, 1):
             query_id = query["query_id"]
+            print(f"[run] {options.strategy}: query {query_number}/{len(queries)} (id={query_id})", file=sys.stderr, flush=True)
             query_start = time.perf_counter()
             ledger_start = len(ledger.entries)
             vector = siliconflow.embed([query["text"]], "dense_query_embedding")[0]
@@ -156,10 +184,12 @@ class ExperimentRunner:
         metrics = evaluate(ranking_ids, _qrel_map(dataset["qrels"]), shortlists if options.strategy == "jev_post_rerank" else None, routed)
         metrics["known_provider_cost_usd"] = ledger.known_cost
         metrics["corpus_dense_embedding_ms"] = round(corpus_embedding_ms, 3)
+        metrics["corpus_embedding_source"] = corpus_embedding_source
         return write_run(options.run_root, options.run_id, manifest={
             "run_id": options.run_id, "strategy": options.strategy, "dataset_hash": dataset["dataset_hash"],
             "query_ids": options.query_ids, "parameters": {
                 "bm25_top_k": options.candidate_k, "dense_top_k": options.candidate_k, "rrf_constant": options.rrf_constant,
                 "final_top_k": options.top_k, "route_threshold": options.route_threshold, "min_laws": options.min_laws, "max_laws": options.max_laws,
-            }, "route_info": route_info, "provider_cost_usd": ledger.known_cost,
+            }, "route_info": route_info, "provider_cost_usd": ledger.known_cost, "corpus_embedding_source": corpus_embedding_source,
+            "corpus_embedding_cache_key": cache_key,
         }, rankings=rankings_rows, metrics=metrics, latency_cost=latency_rows, provider_ledger=ledger.entries)

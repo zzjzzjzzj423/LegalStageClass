@@ -19,6 +19,8 @@ models/
 outputs/
 runs/
 artifacts/
+.cache/legal-stage-class/
+*.egg-info/
 *.log
 
 # Secrets
