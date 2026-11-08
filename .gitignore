@@ -14,7 +14,12 @@ venv/
 
 # Local data, models, and experiment outputs
 data/raw/
-data/processed/
+data/processed/*
+!data/processed/__init__.py
+!data/processed/prepare_stard.py
+!data/processed/classify_domains.py
+!data/processed/file_domains.jsonl
+!data/processed/数据集分类规则.md
 models/
 outputs/
 runs/

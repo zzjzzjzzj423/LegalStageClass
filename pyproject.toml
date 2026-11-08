@@ -12,7 +12,8 @@ requires-python = ">=3.11"
 legal-stage-class = "legal_stage_class.cli:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["legal_stage_class*", "data", "data.processed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

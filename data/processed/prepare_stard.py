@@ -1,4 +1,9 @@
-"""STARD normalization and the mechanically derived law catalog."""
+"""第一阶段：整理 STARD，并按文件名称前缀归组。
+
+当前语料的 55,348 条法条归为 1,258 个文件名称组；这是当前数据的结果，
+不是写死的分组数量。本模块也负责生成和读取实验使用的标准化数据文件。
+第二阶段的 8 大类、22 领域分类位于 classify_domains.py。
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .util import digest, read_jsonl, write_json, write_jsonl
+from legal_stage_class.util import digest, read_jsonl, write_json, write_jsonl
 
 ARTICLE_SUFFIX = re.compile(r"^(?P<law>.+?)第[〇零一二三四五六七八九十百千万0-9]+条(?:之[〇零一二三四五六七八九十百千万0-9]+)?$")
 
@@ -42,7 +47,8 @@ def _normalise_queries(source: Path) -> tuple[list[dict[str, str]], list[dict[st
     return queries, qrels
 
 
-def _normalise_corpus(source: Path) -> list[dict[str, str]]:
+def load_stard_corpus(source: Path) -> list[dict[str, str]]:
+    """读取原始 corpus.jsonl，统一法条 ID、名称和正文字段。"""
     rows = read_jsonl(source)
     corpus: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -60,7 +66,12 @@ def _normalise_corpus(source: Path) -> list[dict[str, str]]:
     return corpus
 
 
-def derive_law_catalog(corpus: list[dict[str, str]]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+def group_articles_by_document(corpus: list[dict[str, str]]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """去掉名称末尾条号，以剩余文件名归组；返回文件目录和法条到文件的映射。
+
+    例如‘劳动合同法第三十八条’与‘劳动合同法第四十六条’归为同一组。
+    这里不判断法律领域，也不按发布机关或文件效力类别分类。
+    """
     grouped: dict[str, list[str]] = {}
     article_laws: dict[str, str] = {}
     failures: list[str] = []
@@ -79,7 +90,8 @@ def derive_law_catalog(corpus: list[dict[str, str]]) -> tuple[list[dict[str, Any
         law_id = "law_" + hashlib.sha256(canonical_name.encode("utf-8")).hexdigest()[:16]
         article_ids = sorted(grouped[canonical_name], key=lambda value: (len(value), value))
         catalog.append({"law_id": law_id, "canonical_law_name": canonical_name, "article_ids": article_ids})
-        article_laws.update({article_id: law_id for article_id in article_ids})
+        for article_id in article_ids:
+            article_laws[article_id] = law_id
     return catalog, article_laws
 
 
@@ -110,10 +122,11 @@ def _splits(raw_root: Path, query_ids: list[str]) -> dict[str, list[str]]:
 
 
 def prepare_stard(raw_root: Path, output_root: Path) -> Path:
+    """生成标准化实验数据，其中 law_catalog.jsonl 是第一阶段的文件分组结果。"""
     corpus_source, queries_source = raw_root / "corpus.jsonl", raw_root / "queries.json"
     if not corpus_source.is_file() or not queries_source.is_file():
         raise ValueError("raw root must contain corpus.jsonl and queries.json")
-    corpus = _normalise_corpus(corpus_source)
+    corpus = load_stard_corpus(corpus_source)
     queries, qrels = _normalise_queries(queries_source)
     corpus_ids, query_ids = {row["article_id"] for row in corpus}, [row["query_id"] for row in queries]
     if len(query_ids) != len(set(query_ids)):
@@ -121,7 +134,7 @@ def prepare_stard(raw_root: Path, output_root: Path) -> Path:
     unknown_qrels = {row["article_id"] for row in qrels} - corpus_ids
     if unknown_qrels:
         raise ValueError(f"qrels refer to absent articles: {sorted(unknown_qrels)[:5]}")
-    catalog, article_laws = derive_law_catalog(corpus)
+    catalog, article_laws = group_articles_by_document(corpus)
     for article in corpus:
         article["law_id"] = article_laws[article["article_id"]]
     splits = _splits(raw_root, query_ids)

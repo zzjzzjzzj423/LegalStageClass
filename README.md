@@ -68,7 +68,7 @@ curl --fail --location --output data/raw/STARD/queries.json \
   https://raw.githubusercontent.com/oneal2000/STARD/main/data/queries.json
 ```
 
-`data/raw/`, `data/processed/`, and `artifacts/` are ignored by Git. Do not add API keys, downloaded data, or run results to a commit.
+`data/raw/`, generated datasets under `data/processed/`, and `artifacts/` are ignored by Git. The two generated domain-classification deliverables documented in `data/README.md` are explicitly tracked exceptions; their processing code lives under `data/processed/`. Do not add API keys, downloaded data, or run results to a commit.
 
 Install the package and derive the normalized dataset:
 

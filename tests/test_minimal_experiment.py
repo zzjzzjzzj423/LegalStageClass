@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import legal_stage_class.experiment as experiment
-from legal_stage_class.data import prepare_stard
+from data.processed.prepare_stard import prepare_stard
 from legal_stage_class.experiment import ExperimentRunner, RunOptions
 from legal_stage_class.providers import ProviderLedger, SiliconFlow
 

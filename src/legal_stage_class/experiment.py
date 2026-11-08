@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import write_run
-from .data import load_dataset
+from data.processed.prepare_stard import load_dataset
 from .embedding_cache import EmbeddingCache, corpus_cache_identity
 from .jev_cache import JevDecisionCache, post_rerank_cache_identity, pre_route_cache_identity
 from .metrics import evaluate

@@ -6,7 +6,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from .data import prepare_stard
+from data.processed.prepare_stard import prepare_stard
 from .experiment import ExperimentRunner, RunOptions
 
 
