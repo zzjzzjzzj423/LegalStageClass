@@ -1,4 +1,0 @@
-interface:
-  display_name: "LegalStageClass SDD"
-  short_description: "Route changes through spec, plan, execution, and E2E."
-  default_prompt: "Use $legal-stage-class-sdd to determine and run the next approved development stage for this repository."

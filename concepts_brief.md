@@ -173,10 +173,12 @@ Probe 必须固定实际 SDK/API 版本、模型标识、请求和响应 schema�
 4. BM25 在本地运行；Dense 使用 SiliconFlow `BAAI/bge-m3`；Jev 使用 TypeSafe；密钥分别来自 `SILICONFLOW_API_KEY` 和 `TYPESAFE_API_KEY`。
 5. corpus embeddings 必须缓存；每次 run 必须输出 rankings、metrics、latency/cost 和 manifest，并记录完整 provenance。
 6. 最终完成门是经 CLI 的真实仓库链路与有界 live provider 调用；未经授权不能用 mock 代替。
+7. `law_catalog` 从 STARD `corpus.jsonl` 派生，而不是引入另一套未对齐的法律语料。生成器从每条 `name` 末尾拆出“第……条”，按精确法律名称前缀分组并建立稳定 `law_id -> article_ids` 映射；当前 corpus 的 55,348 条名称均能通过该初步规则解析，得到 1,257 个名称分组。输出必须记录 corpus 哈希、解析器版本、目录哈希和人工审计结果，且所有 corpus article 与 qrel article 都必须可映射。
+8. 实施顺序固定为：先冻结 split、指标和共享 `baseline_hybrid`，再生成并验收 `law_catalog`、实现 `jev_pre_route`，最后实现消费同一 baseline shortlist 的 `jev_post_rerank`。不得在共享基线完成前直接开发 Jev treatment。
 
 ### 进入正式设计前必须冻结的决策
 
-1. **Law catalog：** 路由单元、规范名称、给 Jev 的文本、article mapping、来源、版本和人工审计方法。
+1. **Law catalog：** 派生来源与基本分组规则已经确定；正式设计仍须冻结稳定 `law_id` 算法、版本/别名是否分开、给 Jev 的文本是仅标题还是另加权威描述、异常审计与迁移方法。
 2. **Provider contract：** Noul/Choice 的准确 API、模型版本、batch 和 n-way 上限、概率/confidence 含义、usage 与错误 schema。
 3. **Pre-route 检索：** 是否批准“全局 BM25 统计 + article allow-list + 同一 Dense/RRF”的推荐语义，以及过滤实现的 exact oracle。
 4. **Routing policy：** score 域、threshold 与 max width 顺序、min width、并列规则、zero-route 和 partial failure 行为。

@@ -18,6 +18,7 @@ data/processed/
 models/
 outputs/
 runs/
+artifacts/
 *.log
 
 # Secrets
