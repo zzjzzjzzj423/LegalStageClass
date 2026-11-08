@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
+from .jev_cache import POST_CHOICE_INSTRUCTIONS, PRE_NOUL_INSTRUCTIONS
 from .util import env_float
 
 
@@ -148,7 +149,7 @@ class Jev:
             questions = {
                 law["law_id"]: {
                     "type": "noul",
-                    "instructions": f"该用户咨询是否与《{law['canonical_law_name']}》相关？",
+                    "instructions": PRE_NOUL_INSTRUCTIONS.format(canonical_law_name=law["canonical_law_name"]),
                     "criteria": {"true": "该法律可能包含适用法条", "false": "该法律不太可能适用"},
                 }
                 for law in batch
@@ -174,7 +175,7 @@ class Jev:
         criteria = {f"a_{article['article_id']}": f"{article['name']}\n{article['content']}" for article in candidates}
         answers = self._decide(
             {"query": query},
-            {"rerank": {"type": "choice", "instructions": "选择最能回答该用户咨询的法条。", "criteria": criteria}},
+            {"rerank": {"type": "choice", "instructions": POST_CHOICE_INSTRUCTIONS, "criteria": criteria}},
             "jev_post_choice",
         )
         answer = answers.get("rerank", {})

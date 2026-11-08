@@ -100,6 +100,8 @@ export SILICONFLOW_EMBEDDING_CONCURRENCY=1
 
 Corpus embeddings are stored locally under `.cache/legal-stage-class/` after the first successful build. The cache is ignored by Git and is never shared through the repository. A later `run` or `acceptance` command reuses it only when the dataset hash, full corpus text, SiliconFlow endpoint, model, encoding format, and input template all match. The three arms in one `acceptance` process also share the same in-memory vectors.
 
+Jev decisions use the same local cache root, under `.cache/legal-stage-class/jev/`. PRE stores the complete score set for all laws, while POST stores the probabilities for its exact Top-10 shortlist. A cached decision is reused only if the query, law catalog or candidate text, Jev endpoint/model, prompt contract, and (for PRE) batch size are unchanged. This lets you adjust PRE routing threshold or rerun the same experiment without asking Jev again. The cache holds provider outputs locally: do not commit or copy it into Git.
+
 Use a different local location if needed:
 
 ```bash
