@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legal-stage-class"
+version = "0.1.0"
+description = "Minimal live experiments for Chinese statute retrieval"
+requires-python = ">=3.11"
+
+[project.scripts]
+legal-stage-class = "legal_stage_class.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
