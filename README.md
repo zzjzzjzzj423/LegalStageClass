@@ -92,6 +92,14 @@ export SILICONFLOW_API_KEY='your-key'
 export TYPESAFE_API_KEY='your-key'
 ```
 
+The first live run embeds all 55,348 corpus articles. It reports batch progress and uses four concurrent SiliconFlow embedding requests by default. If the provider returns HTTP `429`, lower it before retrying:
+
+```bash
+export SILICONFLOW_EMBEDDING_CONCURRENCY=1
+```
+
+The three arms in one `acceptance` process share the same in-memory corpus embeddings, so PRE and POST do not re-embed the corpus. This in-memory reuse is intentionally discarded when the command exits; no embedding cache is committed or persisted.
+
 Run one arm on a bounded query set with:
 
 ```bash

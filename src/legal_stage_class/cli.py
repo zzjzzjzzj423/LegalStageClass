@@ -64,8 +64,9 @@ def main(argv: list[str] | None = None) -> None:
             if len(args.query_ids) != 3:
                 raise ValueError("acceptance requires exactly three fixed query ids")
             destinations = []
+            runner = ExperimentRunner()
             for strategy in ("baseline_hybrid", "jev_pre_route", "jev_post_rerank"):
-                destinations.append(ExperimentRunner().run(args.dataset, RunOptions(
+                destinations.append(runner.run(args.dataset, RunOptions(
                     strategy=strategy, query_ids=args.query_ids, run_id=f"{args.run_prefix}-{strategy}", run_root=args.run_root,
                     candidate_k=args.candidate_k, route_threshold=args.route_threshold, min_laws=args.min_laws,
                     max_laws=args.max_laws, jev_batch_size=args.jev_batch_size, pre_cost_ceiling_usd=args.pre_cost_ceiling_usd,
