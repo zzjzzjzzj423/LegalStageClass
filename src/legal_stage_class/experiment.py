@@ -13,6 +13,7 @@ from typing import Any
 
 from .artifacts import write_run
 from .data import load_dataset
+from .embedding_cache import EmbeddingCache, corpus_cache_identity
 from .metrics import evaluate
 from .providers import Jev, ProviderLedger, SiliconFlow
 from .retrieval import BM25, cosine_topk, rrf
@@ -32,6 +33,7 @@ class RunOptions:
     max_laws: int = 20
     jev_batch_size: int = 32
     pre_cost_ceiling_usd: float = 20.0
+    cache_root: Path = Path(".cache/legal-stage-class")
 
 
 def _qrel_map(rows: list[dict[str, Any]]) -> dict[str, set[str]]:
@@ -111,17 +113,27 @@ class ExperimentRunner:
 
         bm25 = BM25(dataset["corpus"])
         siliconflow = SiliconFlow(ledger)
-        corpus_vectors = self._corpus_vectors.get(dataset["dataset_hash"])
+        cache_key, cache_identity = corpus_cache_identity(
+            dataset["dataset_hash"], dataset["corpus"], endpoint=siliconflow.endpoint, model=siliconflow.model,
+        )
+        cache = EmbeddingCache(options.cache_root)
+        corpus_vectors = self._corpus_vectors.get(cache_key)
+        memory_hit = corpus_vectors is not None
+        if corpus_vectors is None:
+            corpus_vectors = cache.load(cache_key, cache_identity, len(dataset["corpus"]))
+        disk_hit = corpus_vectors is not None and not memory_hit
         if corpus_vectors is None:
             corpus_start = time.perf_counter()
             corpus_vectors = siliconflow.embed([f"{row['name']}\n{row['content']}" for row in dataset["corpus"]], "dense_corpus_embedding")
             corpus_embedding_ms = (time.perf_counter() - corpus_start) * 1000
-            self._corpus_vectors[dataset["dataset_hash"]] = corpus_vectors
+            cache.store(cache_key, cache_identity, corpus_vectors)
+            self._corpus_vectors[cache_key] = corpus_vectors
             corpus_embedding_source = "live"
         else:
+            self._corpus_vectors[cache_key] = corpus_vectors
             corpus_embedding_ms = 0.0
-            corpus_embedding_source = "in_memory_reuse"
-            print("[run] reusing in-memory corpus embeddings from the preceding acceptance arm", file=sys.stderr, flush=True)
+            corpus_embedding_source = "disk_cache" if disk_hit else "in_memory_reuse"
+            print("[run] reusing cached corpus embeddings", file=sys.stderr, flush=True)
         article_by_id = {row["article_id"]: row for row in dataset["corpus"]}
         rankings_rows: list[dict[str, Any]] = []
         latency_rows: list[dict[str, Any]] = []
@@ -179,4 +191,5 @@ class ExperimentRunner:
                 "bm25_top_k": options.candidate_k, "dense_top_k": options.candidate_k, "rrf_constant": options.rrf_constant,
                 "final_top_k": options.top_k, "route_threshold": options.route_threshold, "min_laws": options.min_laws, "max_laws": options.max_laws,
             }, "route_info": route_info, "provider_cost_usd": ledger.known_cost, "corpus_embedding_source": corpus_embedding_source,
+            "corpus_embedding_cache_key": cache_key,
         }, rankings=rankings_rows, metrics=metrics, latency_cost=latency_rows, provider_ledger=ledger.entries)

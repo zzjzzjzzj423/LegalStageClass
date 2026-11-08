@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-laws", type=int, default=20)
     run.add_argument("--jev-batch-size", type=int, default=32)
     run.add_argument("--pre-cost-ceiling-usd", type=float, default=20.0)
+    run.add_argument("--cache-root", type=Path, default=Path(".cache/legal-stage-class"))
     acceptance = commands.add_parser("acceptance", help="run baseline, PRE, and POST for exactly three live queries")
     acceptance.add_argument("--dataset", type=Path, required=True)
     acceptance.add_argument("--query-ids", type=_query_ids, required=True)
@@ -50,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance.add_argument("--max-laws", type=int, default=20)
     acceptance.add_argument("--jev-batch-size", type=int, default=32)
     acceptance.add_argument("--pre-cost-ceiling-usd", type=float, default=20.0)
+    acceptance.add_argument("--cache-root", type=Path, default=Path(".cache/legal-stage-class"))
     return parser
 
 
@@ -70,6 +72,7 @@ def main(argv: list[str] | None = None) -> None:
                     strategy=strategy, query_ids=args.query_ids, run_id=f"{args.run_prefix}-{strategy}", run_root=args.run_root,
                     candidate_k=args.candidate_k, route_threshold=args.route_threshold, min_laws=args.min_laws,
                     max_laws=args.max_laws, jev_batch_size=args.jev_batch_size, pre_cost_ceiling_usd=args.pre_cost_ceiling_usd,
+                    cache_root=args.cache_root,
                 )))
             print(json.dumps({"runs": [str(path) for path in destinations]}, ensure_ascii=False))
             return
@@ -79,6 +82,7 @@ def main(argv: list[str] | None = None) -> None:
             candidate_k=args.candidate_k, top_k=args.top_k, rrf_constant=args.rrf_constant,
             route_threshold=args.route_threshold, min_laws=args.min_laws, max_laws=args.max_laws,
             jev_batch_size=args.jev_batch_size, pre_cost_ceiling_usd=args.pre_cost_ceiling_usd,
+            cache_root=args.cache_root,
         ))
         print(json.dumps({"run": str(destination), "run_id": run_id}, ensure_ascii=False))
     except (ValueError, RuntimeError) as exc:

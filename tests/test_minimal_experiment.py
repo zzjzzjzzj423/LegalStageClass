@@ -26,6 +26,8 @@ def _write_raw(root: Path) -> None:
 
 class FakeSiliconFlow:
     operations = []
+    endpoint = "https://test.invalid/v1/embeddings"
+    model = "test-model"
 
     def __init__(self, ledger, **_kwargs):
         self.ledger = ledger
@@ -66,7 +68,7 @@ def test_each_independent_arm_writes_only_the_five_run_artifacts(tmp_path, monke
     for strategy in ("baseline_hybrid", "jev_pre_route", "jev_post_rerank"):
         destination = ExperimentRunner().run(dataset, RunOptions(
             strategy=strategy, query_ids=["11", "12", "13"], run_id=strategy,
-            run_root=tmp_path / "runs", candidate_k=3,
+            run_root=tmp_path / "runs", candidate_k=3, cache_root=tmp_path / "cache",
         ))
         assert {path.name for path in destination.iterdir()} == {"manifest.json", "rankings.jsonl", "metrics.json", "latency_cost.jsonl", "provider_ledger.jsonl"}
         metrics = json.loads((destination / "metrics.json").read_text(encoding="utf-8"))
@@ -88,11 +90,28 @@ def test_one_acceptance_process_reuses_corpus_embeddings(tmp_path, monkeypatch):
     for strategy in ("baseline_hybrid", "jev_post_rerank"):
         runner.run(dataset, RunOptions(
             strategy=strategy, query_ids=["11", "12", "13"], run_id=strategy,
-            run_root=tmp_path / "runs", candidate_k=3,
+            run_root=tmp_path / "runs", candidate_k=3, cache_root=tmp_path / "cache",
         ))
     assert FakeSiliconFlow.operations.count("dense_corpus_embedding") == 1
     manifest = json.loads((tmp_path / "runs" / "jev_post_rerank" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["corpus_embedding_source"] == "in_memory_reuse"
+
+
+def test_fresh_runner_uses_verified_local_corpus_cache(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    _write_raw(raw)
+    dataset = prepare_stard(raw, tmp_path / "processed")
+    FakeSiliconFlow.operations.clear()
+    monkeypatch.setattr(experiment, "SiliconFlow", FakeSiliconFlow)
+    cache_root = tmp_path / "cache"
+    for run_id in ("first", "second"):
+        ExperimentRunner().run(dataset, RunOptions(
+            strategy="baseline_hybrid", query_ids=["11", "12", "13"], run_id=run_id,
+            run_root=tmp_path / "runs", candidate_k=3, cache_root=cache_root,
+        ))
+    assert FakeSiliconFlow.operations.count("dense_corpus_embedding") == 1
+    manifest = json.loads((tmp_path / "runs" / "second" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["corpus_embedding_source"] == "disk_cache"
 
 
 def test_parallel_embedding_preserves_input_order(monkeypatch):
