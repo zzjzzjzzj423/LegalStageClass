@@ -117,6 +117,12 @@ legal-stage-class run \
   --query-ids 11,12,13
 ```
 
+For the budget-bounded 600-query experiment, use the committed, stratified `tune_train` selection. It excludes the 309-query `final` split; its exact query IDs, seed, strata, and integrity hash are in `configs/stard_tune_train_600_v1.json`. On macOS, pass the list to the CLI with:
+
+```bash
+QUERY_IDS="$(jq -r '.query_ids | join(",")' configs/stard_tune_train_600_v1.json)"
+```
+
 For the first live acceptance, use exactly three fixed query IDs. This runs baseline, then PRE, then POST:
 
 ```bash
