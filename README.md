@@ -100,6 +100,8 @@ export SILICONFLOW_EMBEDDING_CONCURRENCY=1
 
 Corpus embeddings are stored locally under `.cache/legal-stage-class/` after the first successful build. The cache is ignored by Git and is never shared through the repository. A later `run` or `acceptance` command reuses it only when the dataset hash, full corpus text, SiliconFlow endpoint, model, encoding format, and input template all match. The three arms in one `acceptance` process also share the same in-memory vectors.
 
+Jev decisions use the same local cache root, under `.cache/legal-stage-class/jev/`. PRE stores the complete score set for all laws, while POST stores the probabilities for its exact Top-10 shortlist. A cached decision is reused only if the query, law catalog or candidate text, Jev endpoint/model, prompt contract, and (for PRE) batch size are unchanged. This lets you adjust PRE routing threshold or rerun the same experiment without asking Jev again. The cache holds provider outputs locally: do not commit or copy it into Git.
+
 Use a different local location if needed:
 
 ```bash
@@ -113,6 +115,12 @@ legal-stage-class run \
   --dataset data/processed/stard/<dataset_hash> \
   --strategy baseline_hybrid \
   --query-ids 11,12,13
+```
+
+For the budget-bounded 600-query experiment, use the committed, stratified `tune_train` selection. It excludes the 309-query `final` split; its exact query IDs, seed, strata, and integrity hash are in `configs/stard_tune_train_600_v1.json`. On macOS, pass the list to the CLI with:
+
+```bash
+QUERY_IDS="$(jq -r '.query_ids | join(",")' configs/stard_tune_train_600_v1.json)"
 ```
 
 For the first live acceptance, use exactly three fixed query IDs. This runs baseline, then PRE, then POST:

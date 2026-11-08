@@ -39,14 +39,19 @@ class FakeSiliconFlow:
 
 
 class FakeJev:
+    route_calls = 0
+    rerank_calls = 0
+
     def __init__(self, ledger):
         self.ledger = ledger
 
     def route_laws(self, _query, laws, _batch_size):
+        type(self).route_calls += 1
         self.ledger.add(provider="typesafe_jev", operation="jev_pre_noul", elapsed_ms=1, usage={"input_tokens": len(laws)}, request_id="jev-test", cost_per_1k=0)
         return {law["law_id"]: 0.9 if law["canonical_law_name"] == "劳动法" else 0.1 for law in laws}
 
     def rerank(self, _query, candidates):
+        type(self).rerank_calls += 1
         return [(candidate["article_id"], 1.0 - index / 10) for index, candidate in enumerate(candidates)], {"choice": "a_1", "confidence": 0.9}
 
 
@@ -119,3 +124,30 @@ def test_parallel_embedding_preserves_input_order(monkeypatch):
     client = SiliconFlow(ProviderLedger(), batch_size=2, concurrency=2)
     monkeypatch.setattr(client, "_embed_batch", lambda batch, _operation: [[float(text)] for text in batch])
     assert client.embed(["1", "2", "3", "4"], "test") == [[1.0], [2.0], [3.0], [4.0]]
+
+
+def test_fresh_runner_reuses_complete_jev_pre_and_post_decisions(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    _write_raw(raw)
+    dataset = prepare_stard(raw, tmp_path / "processed")
+    FakeJev.route_calls = 0
+    FakeJev.rerank_calls = 0
+    monkeypatch.setattr(experiment, "SiliconFlow", FakeSiliconFlow)
+    monkeypatch.setattr(experiment, "Jev", FakeJev)
+    cache_root = tmp_path / "cache"
+    for run_id in ("first-pre", "second-pre"):
+        ExperimentRunner().run(dataset, RunOptions(
+            strategy="jev_pre_route", query_ids=["11", "12", "13"], run_id=run_id,
+            run_root=tmp_path / "runs", candidate_k=3, cache_root=cache_root,
+        ))
+    for run_id in ("first-post", "second-post"):
+        ExperimentRunner().run(dataset, RunOptions(
+            strategy="jev_post_rerank", query_ids=["11", "12", "13"], run_id=run_id,
+            run_root=tmp_path / "runs", candidate_k=3, cache_root=cache_root,
+        ))
+    assert FakeJev.route_calls == 3
+    assert FakeJev.rerank_calls == 3
+    pre_manifest = json.loads((tmp_path / "runs" / "second-pre" / "manifest.json").read_text(encoding="utf-8"))
+    post_manifest = json.loads((tmp_path / "runs" / "second-post" / "manifest.json").read_text(encoding="utf-8"))
+    assert set(pre_manifest["jev_decision_cache_sources"]["pre_route"].values()) == {"disk_cache"}
+    assert set(post_manifest["jev_decision_cache_sources"]["post_rerank"].values()) == {"disk_cache"}

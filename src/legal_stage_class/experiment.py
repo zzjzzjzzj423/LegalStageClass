@@ -14,6 +14,7 @@ from typing import Any
 from .artifacts import write_run
 from .data import load_dataset
 from .embedding_cache import EmbeddingCache, corpus_cache_identity
+from .jev_cache import JevDecisionCache, post_rerank_cache_identity, pre_route_cache_identity
 from .metrics import evaluate
 from .providers import Jev, ProviderLedger, SiliconFlow
 from .retrieval import BM25, cosine_topk, rrf
@@ -71,21 +72,37 @@ class ExperimentRunner:
         queries = [query_by_id[query_id] for query_id in options.query_ids]
         print(f"[run] {options.strategy}: {len(queries)} queries; loading BM25 and Dense index", file=sys.stderr, flush=True)
         ledger = ProviderLedger()
+        jev_cache = JevDecisionCache(options.cache_root)
         allowed: dict[str, set[str]] = {}
         route_info: dict[str, Any] = {}
         route_elapsed_ms: dict[str, float] = {}
+        jev_cache_sources: dict[str, dict[str, str]] = {"pre_route": {}, "post_rerank": {}}
         query_ledger: dict[str, list[dict[str, Any]]] = {row["query_id"]: [] for row in queries}
         if options.strategy == "jev_pre_route":
-            jev = Jev(ledger)
+            # Delay provider construction until a miss: a fully cached rerun
+            # must not need an API key or make a remote request.
+            jev: Jev | None = None
             # Full STARD runs are cost-calibrated before scoring the remaining queries.
             calibration = queries[: min(10, len(queries))] if len(queries) > 10 else []
             scored: dict[str, dict[str, float]] = {}
             for query in calibration:
-                route_start = time.perf_counter()
-                ledger_start = len(ledger.entries)
-                scored[query["query_id"]] = jev.route_laws(query["text"], dataset["laws"], options.jev_batch_size)
-                route_elapsed_ms[query["query_id"]] = (time.perf_counter() - route_start) * 1000
-                query_ledger[query["query_id"]].extend(ledger.entries[ledger_start:])
+                query_id = query["query_id"]
+                cache_key, cache_identity = pre_route_cache_identity(query["text"], dataset["laws"], options.jev_batch_size)
+                cached = jev_cache.load_pre_scores(cache_key, cache_identity, [law["law_id"] for law in dataset["laws"]])
+                if cached is not None:
+                    scored[query_id] = cached
+                    jev_cache_sources["pre_route"][query_id] = "disk_cache"
+                    route_elapsed_ms[query_id] = 0.0
+                else:
+                    route_start = time.perf_counter()
+                    ledger_start = len(ledger.entries)
+                    if jev is None:
+                        jev = Jev(ledger)
+                    scored[query_id] = jev.route_laws(query["text"], dataset["laws"], options.jev_batch_size)
+                    route_elapsed_ms[query_id] = (time.perf_counter() - route_start) * 1000
+                    query_ledger[query_id].extend(ledger.entries[ledger_start:])
+                    jev_cache.store_pre_scores(cache_key, cache_identity, scored[query_id])
+                    jev_cache_sources["pre_route"][query_id] = "live"
             if calibration:
                 known = ledger.known_cost
                 reserved_per_judgment = float(os.environ.get("TYPESAFE_JEV_RESERVED_USD_PER_JUDGMENT", "0.00003"))
@@ -98,11 +115,22 @@ class ExperimentRunner:
                 if query_id in scored:
                     scores = scored[query_id]
                 else:
-                    route_start = time.perf_counter()
-                    ledger_start = len(ledger.entries)
-                    scores = jev.route_laws(query["text"], dataset["laws"], options.jev_batch_size)
-                    route_elapsed_ms[query_id] = (time.perf_counter() - route_start) * 1000
-                    query_ledger[query_id].extend(ledger.entries[ledger_start:])
+                    cache_key, cache_identity = pre_route_cache_identity(query["text"], dataset["laws"], options.jev_batch_size)
+                    cached = jev_cache.load_pre_scores(cache_key, cache_identity, [law["law_id"] for law in dataset["laws"]])
+                    if cached is not None:
+                        scores = cached
+                        route_elapsed_ms[query_id] = 0.0
+                        jev_cache_sources["pre_route"][query_id] = "disk_cache"
+                    else:
+                        route_start = time.perf_counter()
+                        ledger_start = len(ledger.entries)
+                        if jev is None:
+                            jev = Jev(ledger)
+                        scores = jev.route_laws(query["text"], dataset["laws"], options.jev_batch_size)
+                        route_elapsed_ms[query_id] = (time.perf_counter() - route_start) * 1000
+                        query_ledger[query_id].extend(ledger.entries[ledger_start:])
+                        jev_cache.store_pre_scores(cache_key, cache_identity, scores)
+                        jev_cache_sources["pre_route"][query_id] = "live"
                 law_ids = _select_laws(scores, options.route_threshold, options.min_laws, options.max_laws)
                 article_ids = set()
                 for law in dataset["laws"]:
@@ -154,7 +182,16 @@ class ExperimentRunner:
             post_metadata: dict[str, Any] = {}
             if options.strategy == "jev_post_rerank":
                 before_post = time.perf_counter()
-                reranked, post_metadata = Jev(ledger).rerank(query["text"], [article_by_id[article_id] for article_id in shortlist])
+                candidates = [article_by_id[article_id] for article_id in shortlist]
+                post_cache_key, post_cache_identity = post_rerank_cache_identity(query["text"], candidates)
+                cached_post = jev_cache.load_post_rerank(post_cache_key, post_cache_identity, shortlist)
+                if cached_post is not None:
+                    reranked, post_metadata = cached_post
+                    jev_cache_sources["post_rerank"][query_id] = "disk_cache"
+                else:
+                    reranked, post_metadata = Jev(ledger).rerank(query["text"], candidates)
+                    jev_cache.store_post_rerank(post_cache_key, post_cache_identity, reranked, post_metadata)
+                    jev_cache_sources["post_rerank"][query_id] = "live"
                 final = reranked[: options.top_k]
                 post_metadata["incremental_jev_post_ms"] = round((time.perf_counter() - before_post) * 1000, 3)
             else:
@@ -192,4 +229,5 @@ class ExperimentRunner:
                 "final_top_k": options.top_k, "route_threshold": options.route_threshold, "min_laws": options.min_laws, "max_laws": options.max_laws,
             }, "route_info": route_info, "provider_cost_usd": ledger.known_cost, "corpus_embedding_source": corpus_embedding_source,
             "corpus_embedding_cache_key": cache_key,
+            "jev_decision_cache_sources": jev_cache_sources,
         }, rankings=rankings_rows, metrics=metrics, latency_cost=latency_rows, provider_ledger=ledger.entries)
