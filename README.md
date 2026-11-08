@@ -56,7 +56,21 @@ tests/                   Tests
 
 The implementation currently contains only three independent arms: `baseline_hybrid`, `jev_pre_route`, and `jev_post_rerank`. It does not implement concept tagging, a cross-encoder, validation/final locking, or an offline embedding model.
 
-Prepare a downloaded STARD directory containing `corpus.jsonl` and `queries.json` (and, when available, `qrels.train.tsv` / `qrels.dev.tsv`):
+### Dataset setup for collaborators
+
+The dataset is intentionally not committed to this repository. Each collaborator downloads the same two public STARD source files locally, then derives the identical processed dataset. From the repository root:
+
+```bash
+mkdir -p data/raw/STARD
+curl --fail --location --output data/raw/STARD/corpus.jsonl \
+  https://raw.githubusercontent.com/oneal2000/STARD/main/data/corpus.jsonl
+curl --fail --location --output data/raw/STARD/queries.json \
+  https://raw.githubusercontent.com/oneal2000/STARD/main/data/queries.json
+```
+
+`data/raw/`, `data/processed/`, and `artifacts/` are ignored by Git. Do not add API keys, downloaded data, or run results to a commit.
+
+Install the package and derive the normalized dataset:
 
 ```bash
 python -m pip install -e .
@@ -65,7 +79,20 @@ legal-stage-class data prepare --raw-root data/raw/STARD
 
 The command writes only these normalized files under `data/processed/stard/<dataset_hash>/`: `queries.jsonl`, `corpus.jsonl`, `qrels.jsonl`, `splits.json`, and a mechanically derived `law_catalog.jsonl`. The catalog groups article names by the final `第X条` or `第X条之X` suffix.
 
-Set `SILICONFLOW_API_KEY` for all arms and `TYPESAFE_API_KEY` for PRE/POST. Dense retrieval always calls SiliconFlow `BAAI/bge-m3`; it does not fall back to local embeddings. Run one arm on a bounded query set with:
+For the current upstream snapshot, preparation produces:
+
+```text
+data/processed/stard/d2bc0bf33155184c150c400cf1b29e03230e0dfc5c0a098dac5fdb3a59020482/
+```
+
+Set `SILICONFLOW_API_KEY` for all arms and `TYPESAFE_API_KEY` for PRE/POST in the shell that runs the experiment. Dense retrieval always calls SiliconFlow `BAAI/bge-m3`; it does not fall back to local embeddings:
+
+```bash
+export SILICONFLOW_API_KEY='your-key'
+export TYPESAFE_API_KEY='your-key'
+```
+
+Run one arm on a bounded query set with:
 
 ```bash
 legal-stage-class run \
