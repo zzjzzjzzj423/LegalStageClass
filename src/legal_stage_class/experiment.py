@@ -1,21 +1,26 @@
-"""Three independent, minimal live retrieval experiment arms."""
+"""The three domain → file → article retrieval experiment arms.
+
+The arms share every stage except the studied intervention: the baseline ranks
+file titles locally, PRE asks Jev to rank that same file directory, and POST
+reranks the baseline article shortlist.  PRE and POST are never combined.
+"""
 
 from __future__ import annotations
 
-import os
 import sys
 import time
-import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .artifacts import write_run
 from data.processed.prepare_stard import load_dataset
+
+from .artifacts import write_run
 from .embedding_cache import EmbeddingCache, corpus_cache_identity
-from .jev_cache import JevDecisionCache, post_rerank_cache_identity, pre_route_cache_identity
+from .jev_cache import JevDecisionCache, file_choice_cache_identity, post_rerank_cache_identity
 from .metrics import evaluate
+from .navigation import LocalBgeNavigator
 from .providers import Jev, ProviderLedger, SiliconFlow
 from .retrieval import BM25, cosine_topk, rrf
 
@@ -29,11 +34,13 @@ class RunOptions:
     candidate_k: int = 1000
     top_k: int = 10
     rrf_constant: int = 60
-    route_threshold: float = 0.5
-    min_laws: int = 1
-    max_laws: int = 20
-    jev_batch_size: int = 32
-    pre_cost_ceiling_usd: float = 20.0
+    domain_initial_n: int = 4
+    choice_max_files: int = 255
+    selected_files: int = 2
+    post_shortlist_n: int = 20
+    dense_backend: str = "local"
+    file_domains_path: Path = Path("data/processed/file_domains.jsonl")
+    navigation_model: str = "BAAI/bge-small-zh-v1.5"
     cache_root: Path = Path(".cache/legal-stage-class")
 
 
@@ -45,189 +52,192 @@ def _qrel_map(rows: list[dict[str, Any]]) -> dict[str, set[str]]:
     return output
 
 
-def _select_laws(scores: dict[str, float], threshold: float, minimum: int, maximum: int) -> list[str]:
-    ordered = sorted(scores, key=lambda law_id: (-scores[law_id], law_id))
-    selected = [law_id for law_id in ordered if scores[law_id] >= threshold][:maximum]
-    if len(selected) < minimum:
-        selected = ordered[:minimum]
-    return selected[:maximum]
+def _article_ids(laws: list[dict[str, Any]]) -> set[str]:
+    return {article_id for law in laws for article_id in law["article_ids"]}
 
 
 class ExperimentRunner:
+    """Run independent arms while reusing only frozen corpus vectors."""
+
     def __init__(self) -> None:
-        # This cache exists only for one process (not on disk). It lets the
-        # three independent acceptance arms use the same frozen corpus index.
         self._corpus_vectors: dict[str, list[list[float]]] = {}
+        self._navigators: dict[tuple[Path, str], LocalBgeNavigator] = {}
+
+    def _navigator(self, options: RunOptions, laws: list[dict[str, Any]]) -> LocalBgeNavigator:
+        key = (options.file_domains_path.resolve(), options.navigation_model)
+        navigator = self._navigators.get(key)
+        if navigator is None:
+            navigator = LocalBgeNavigator(options.file_domains_path, options.navigation_model, laws)
+            self._navigators[key] = navigator
+        return navigator
 
     def run(self, dataset_path: Path, options: RunOptions) -> Path:
         if options.strategy not in {"baseline_hybrid", "jev_pre_route", "jev_post_rerank"}:
             raise ValueError("strategy must be baseline_hybrid, jev_pre_route, or jev_post_rerank")
-        if options.min_laws < 1 or options.max_laws < options.min_laws:
-            raise ValueError("route law bounds must satisfy 1 <= min_laws <= max_laws")
+        if options.domain_initial_n < 1 or options.choice_max_files < 1 or options.selected_files < 1:
+            raise ValueError("domain_initial_n, choice_max_files, and selected_files must be positive")
+        if options.dense_backend not in {"local", "siliconflow"}:
+            raise ValueError("dense_backend must be local or siliconflow")
+        if options.post_shortlist_n < options.top_k:
+            raise ValueError("post_shortlist_n must be at least top_k")
+
         dataset = load_dataset(dataset_path)
         query_by_id = {row["query_id"]: row for row in dataset["queries"]}
         missing = set(options.query_ids) - set(query_by_id)
         if missing:
             raise ValueError(f"unknown query ids: {sorted(missing)}")
         queries = [query_by_id[query_id] for query_id in options.query_ids]
-        print(f"[run] {options.strategy}: {len(queries)} queries; loading BM25 and Dense index", file=sys.stderr, flush=True)
+        navigator = self._navigator(options, dataset["laws"])
+        navigation_start = time.perf_counter()
+        navigator.warm()
+        navigation_warm_ms = (time.perf_counter() - navigation_start) * 1000
         ledger = ProviderLedger()
         jev_cache = JevDecisionCache(options.cache_root)
-        allowed: dict[str, set[str]] = {}
-        route_info: dict[str, Any] = {}
-        route_elapsed_ms: dict[str, float] = {}
-        jev_cache_sources: dict[str, dict[str, str]] = {"pre_route": {}, "post_rerank": {}}
-        query_ledger: dict[str, list[dict[str, Any]]] = {row["query_id"]: [] for row in queries}
-        if options.strategy == "jev_pre_route":
-            # Delay provider construction until a miss: a fully cached rerun
-            # must not need an API key or make a remote request.
-            jev: Jev | None = None
-            # Full STARD runs are cost-calibrated before scoring the remaining queries.
-            calibration = queries[: min(10, len(queries))] if len(queries) > 10 else []
-            scored: dict[str, dict[str, float]] = {}
-            for query in calibration:
-                query_id = query["query_id"]
-                cache_key, cache_identity = pre_route_cache_identity(query["text"], dataset["laws"], options.jev_batch_size)
-                cached = jev_cache.load_pre_scores(cache_key, cache_identity, [law["law_id"] for law in dataset["laws"]])
-                if cached is not None:
-                    scored[query_id] = cached
-                    jev_cache_sources["pre_route"][query_id] = "disk_cache"
-                    route_elapsed_ms[query_id] = 0.0
-                else:
-                    route_start = time.perf_counter()
-                    ledger_start = len(ledger.entries)
-                    if jev is None:
-                        jev = Jev(ledger)
-                    scored[query_id] = jev.route_laws(query["text"], dataset["laws"], options.jev_batch_size)
-                    route_elapsed_ms[query_id] = (time.perf_counter() - route_start) * 1000
-                    query_ledger[query_id].extend(ledger.entries[ledger_start:])
-                    jev_cache.store_pre_scores(cache_key, cache_identity, scored[query_id])
-                    jev_cache_sources["pre_route"][query_id] = "live"
-            if calibration:
-                known = ledger.known_cost
-                reserved_per_judgment = float(os.environ.get("TYPESAFE_JEV_RESERVED_USD_PER_JUDGMENT", "0.00003"))
-                predicted = known / len(calibration) * len(queries) if known else reserved_per_judgment * len(dataset["laws"]) * len(queries)
-                if predicted > options.pre_cost_ceiling_usd:
-                    raise RuntimeError(f"PRE calibration predicts ${predicted:.4f}, above ${options.pre_cost_ceiling_usd:.2f}; refusing full run")
-                route_info["pre_calibration"] = {"query_count": len(calibration), "predicted_cost_usd": predicted, "ceiling_usd": options.pre_cost_ceiling_usd, "cost_basis": "provider_usage" if known else "reserved_per_judgment"}
-            for query in queries:
-                query_id = query["query_id"]
-                if query_id in scored:
-                    scores = scored[query_id]
-                else:
-                    cache_key, cache_identity = pre_route_cache_identity(query["text"], dataset["laws"], options.jev_batch_size)
-                    cached = jev_cache.load_pre_scores(cache_key, cache_identity, [law["law_id"] for law in dataset["laws"]])
-                    if cached is not None:
-                        scores = cached
-                        route_elapsed_ms[query_id] = 0.0
-                        jev_cache_sources["pre_route"][query_id] = "disk_cache"
-                    else:
-                        route_start = time.perf_counter()
-                        ledger_start = len(ledger.entries)
-                        if jev is None:
-                            jev = Jev(ledger)
-                        scores = jev.route_laws(query["text"], dataset["laws"], options.jev_batch_size)
-                        route_elapsed_ms[query_id] = (time.perf_counter() - route_start) * 1000
-                        query_ledger[query_id].extend(ledger.entries[ledger_start:])
-                        jev_cache.store_pre_scores(cache_key, cache_identity, scores)
-                        jev_cache_sources["pre_route"][query_id] = "live"
-                law_ids = _select_laws(scores, options.route_threshold, options.min_laws, options.max_laws)
-                article_ids = set()
-                for law in dataset["laws"]:
-                    if law["law_id"] in law_ids:
-                        article_ids.update(law["article_ids"])
-                allowed[query_id] = article_ids
-                route_info[query_id] = {"selected_law_ids": law_ids, "selected_law_scores": {law_id: scores[law_id] for law_id in law_ids}, "allowed_article_count": len(article_ids)}
+        article_by_id = {row["article_id"]: row for row in dataset["corpus"]}
 
+        print(f"[run] {options.strategy}: {len(queries)} queries; loading shared indices", file=sys.stderr, flush=True)
         bm25 = BM25(dataset["corpus"])
-        siliconflow = SiliconFlow(ledger)
-        cache_key, cache_identity = corpus_cache_identity(
-            dataset["dataset_hash"], dataset["corpus"], endpoint=siliconflow.endpoint, model=siliconflow.model,
+        if options.dense_backend == "siliconflow":
+            dense_client: SiliconFlow | None = SiliconFlow(ledger)
+            dense_endpoint, dense_model, dense_provider = dense_client.endpoint, dense_client.model, "siliconflow"
+        else:
+            dense_client = None
+            dense_endpoint, dense_model, dense_provider = "local://transformers", options.navigation_model, "local_bge"
+        vector_cache_key, vector_identity = corpus_cache_identity(
+            dataset["dataset_hash"], dataset["corpus"], endpoint=dense_endpoint, model=dense_model, provider=dense_provider,
         )
-        cache = EmbeddingCache(options.cache_root)
-        corpus_vectors = self._corpus_vectors.get(cache_key)
+        vector_cache = EmbeddingCache(options.cache_root)
+        corpus_vectors = self._corpus_vectors.get(vector_cache_key)
         memory_hit = corpus_vectors is not None
         if corpus_vectors is None:
-            corpus_vectors = cache.load(cache_key, cache_identity, len(dataset["corpus"]))
+            corpus_vectors = vector_cache.load(vector_cache_key, vector_identity, len(dataset["corpus"]))
         disk_hit = corpus_vectors is not None and not memory_hit
         if corpus_vectors is None:
-            corpus_start = time.perf_counter()
-            corpus_vectors = siliconflow.embed([f"{row['name']}\n{row['content']}" for row in dataset["corpus"]], "dense_corpus_embedding")
-            corpus_embedding_ms = (time.perf_counter() - corpus_start) * 1000
-            cache.store(cache_key, cache_identity, corpus_vectors)
-            self._corpus_vectors[cache_key] = corpus_vectors
+            started = time.perf_counter()
+            corpus_texts = [f"{row['name']}\n{row['content']}" for row in dataset["corpus"]]
+            corpus_vectors = (dense_client.embed(corpus_texts, "dense_corpus_embedding") if dense_client
+                              else navigator.embed(corpus_texts, "dense_corpus_embedding"))
+            corpus_embedding_ms = (time.perf_counter() - started) * 1000
+            vector_cache.store(vector_cache_key, vector_identity, corpus_vectors)
             corpus_embedding_source = "live"
         else:
-            self._corpus_vectors[cache_key] = corpus_vectors
             corpus_embedding_ms = 0.0
             corpus_embedding_source = "disk_cache" if disk_hit else "in_memory_reuse"
-            print("[run] reusing cached corpus embeddings", file=sys.stderr, flush=True)
-        article_by_id = {row["article_id"]: row for row in dataset["corpus"]}
+        self._corpus_vectors[vector_cache_key] = corpus_vectors
+
         rankings_rows: list[dict[str, Any]] = []
         latency_rows: list[dict[str, Any]] = []
-        ranking_ids: dict[str, list[str]] = {}
+        final_rankings: dict[str, list[str]] = {}
+        domain_allowed: dict[str, set[str]] = {}
+        file_allowed: dict[str, set[str]] = {}
         shortlists: dict[str, list[str]] = {}
-        for query_number, query in enumerate(queries, 1):
-            query_id = query["query_id"]
-            print(f"[run] {options.strategy}: query {query_number}/{len(queries)} (id={query_id})", file=sys.stderr, flush=True)
-            query_start = time.perf_counter()
-            ledger_start = len(ledger.entries)
-            vector = siliconflow.embed([query["text"]], "dense_query_embedding")[0]
-            permitted = allowed.get(query_id)
-            bm25_ranking = bm25.topk(query["text"], options.candidate_k, permitted)
-            dense_ranking = cosine_topk(vector, dataset["corpus"], corpus_vectors, options.candidate_k, permitted)
-            fused = rrf([bm25_ranking, dense_ranking], options.top_k, options.rrf_constant)
+        cache_sources: dict[str, dict[str, str]] = {"file_choice": {}, "post_rerank": {}}
+
+        for number, query in enumerate(queries, 1):
+            query_id, text = query["query_id"], query["text"]
+            print(f"[run] {options.strategy}: query {number}/{len(queries)} (id={query_id})", file=sys.stderr, flush=True)
+            started = time.perf_counter()
+            provider_start = len(ledger.entries)
+
+            domain_route = navigator.select_domains(text, options.domain_initial_n, options.choice_max_files)
+            candidate_laws = domain_route["laws"]
+            domain_allowed[query_id] = _article_ids(candidate_laws)
+
+            if options.strategy == "jev_pre_route":
+                file_cache_key, file_identity = file_choice_cache_identity(text, candidate_laws)
+                cached = jev_cache.load_file_choice(file_cache_key, file_identity, [law["law_id"] for law in candidate_laws])
+                if cached is None:
+                    ranked_laws, file_metadata = Jev(ledger).choose_files(text, candidate_laws)
+                    jev_cache.store_file_choice(file_cache_key, file_identity, ranked_laws, file_metadata)
+                    cache_sources["file_choice"][query_id] = "live"
+                else:
+                    ranked_laws, file_metadata = cached
+                    cache_sources["file_choice"][query_id] = "disk_cache"
+                selected_laws = ranked_laws[: options.selected_files]
+                file_selection = {
+                    "method": "jev_choice", "selected_law_ids": [law_id for law_id, _ in selected_laws],
+                    "probabilities": {law_id: probability for law_id, probability in ranked_laws}, **file_metadata,
+                }
+            else:
+                ranked_laws = navigator.rank_titles(text, candidate_laws)
+                selected_laws = ranked_laws[: options.selected_files]
+                file_selection = {
+                    "method": "title_similarity", "selected_law_ids": [law_id for law_id, _ in selected_laws],
+                    "similarities": {law_id: score for law_id, score in ranked_laws},
+                }
+
+            law_by_id = {law["law_id"]: law for law in candidate_laws}
+            chosen_laws = [law_by_id[law_id] for law_id, _ in selected_laws]
+            permitted = _article_ids(chosen_laws)
+            if not permitted:
+                raise RuntimeError("file selection produced no allowed articles")
+            file_allowed[query_id] = permitted
+
+            query_vector = (dense_client.embed([text], "dense_query_embedding")[0] if dense_client
+                            else navigator.embed([text], "dense_query_embedding")[0])
+            bm25_ranking = bm25.topk(text, options.candidate_k, permitted)
+            dense_ranking = cosine_topk(query_vector, dataset["corpus"], corpus_vectors, options.candidate_k, permitted)
+            fusion_depth = options.post_shortlist_n if options.strategy == "jev_post_rerank" else options.top_k
+            fused = rrf([bm25_ranking, dense_ranking], fusion_depth, options.rrf_constant)
             shortlist = [article_id for article_id, _ in fused]
             shortlists[query_id] = shortlist
+
             post_metadata: dict[str, Any] = {}
             if options.strategy == "jev_post_rerank":
-                before_post = time.perf_counter()
                 candidates = [article_by_id[article_id] for article_id in shortlist]
-                post_cache_key, post_cache_identity = post_rerank_cache_identity(query["text"], candidates)
-                cached_post = jev_cache.load_post_rerank(post_cache_key, post_cache_identity, shortlist)
-                if cached_post is not None:
-                    reranked, post_metadata = cached_post
-                    jev_cache_sources["post_rerank"][query_id] = "disk_cache"
+                post_cache_key, post_identity = post_rerank_cache_identity(text, candidates)
+                cached_post = jev_cache.load_post_rerank(post_cache_key, post_identity, shortlist)
+                if cached_post is None:
+                    reranked, post_metadata = Jev(ledger).rerank(text, candidates)
+                    jev_cache.store_post_rerank(post_cache_key, post_identity, reranked, post_metadata)
+                    cache_sources["post_rerank"][query_id] = "live"
                 else:
-                    reranked, post_metadata = Jev(ledger).rerank(query["text"], candidates)
-                    jev_cache.store_post_rerank(post_cache_key, post_cache_identity, reranked, post_metadata)
-                    jev_cache_sources["post_rerank"][query_id] = "live"
+                    reranked, post_metadata = cached_post
+                    cache_sources["post_rerank"][query_id] = "disk_cache"
                 final = reranked[: options.top_k]
-                post_metadata["incremental_jev_post_ms"] = round((time.perf_counter() - before_post) * 1000, 3)
             else:
-                final = fused
-            query_ledger[query_id].extend(ledger.entries[ledger_start:])
+                final = fused[: options.top_k]
+
             bm25_rank = {article_id: rank for rank, (article_id, _) in enumerate(bm25_ranking, 1)}
             dense_rank = {article_id: rank for rank, (article_id, _) in enumerate(dense_ranking, 1)}
-            ranking_ids[query_id] = [article_id for article_id, _ in final]
+            final_rankings[query_id] = [article_id for article_id, _ in final]
+            query_ledger = ledger.entries[provider_start:]
             rankings_rows.append({
-                "query_id": query_id, "strategy": options.strategy, "query": query["text"],
-                "shortlist_article_ids": shortlist, "ranking": [
-                    {"rank": rank, "article_id": article_id, "score": score, "bm25_rank": bm25_rank.get(article_id), "dense_rank": dense_rank.get(article_id)}
+                "query_id": query_id, "strategy": options.strategy, "query": text,
+                "domain_route": {key: value for key, value in domain_route.items() if key != "laws"},
+                "file_selection": file_selection, "allowed_article_count": len(permitted),
+                "shortlist_article_ids": shortlist,
+                "ranking": [
+                    {"rank": rank, "article_id": article_id, "score": score,
+                     "bm25_rank": bm25_rank.get(article_id), "dense_rank": dense_rank.get(article_id)}
                     for rank, (article_id, score) in enumerate(final, 1)
                 ],
-                **({"pre_route": route_info[query_id]} if options.strategy == "jev_pre_route" else {}),
                 **({"post_rerank": post_metadata} if options.strategy == "jev_post_rerank" else {}),
             })
-            query_costs = [entry["cost_usd"] for entry in query_ledger[query_id]]
             latency_rows.append({
                 "query_id": query_id, "strategy": options.strategy,
-                "query_to_final_topk_ms": round(route_elapsed_ms.get(query_id, 0.0) + (time.perf_counter() - query_start) * 1000, 3),
-                "cost_usd": round(sum(float(cost or 0.0) for cost in query_costs), 8) if query_costs else 0.0,
+                "query_to_final_topk_ms": round((time.perf_counter() - started) * 1000, 3),
+                "cost_usd": round(sum(float(entry["cost_usd"] or 0.0) for entry in query_ledger), 8),
                 "cost_status": "reserved_or_estimated",
-                **({"incremental_jev_post_ms": post_metadata["incremental_jev_post_ms"]} if options.strategy == "jev_post_rerank" else {}),
             })
-        routed = allowed if options.strategy == "jev_pre_route" else None
-        metrics = evaluate(ranking_ids, _qrel_map(dataset["qrels"]), shortlists if options.strategy == "jev_post_rerank" else None, routed)
-        metrics["known_provider_cost_usd"] = ledger.known_cost
-        metrics["corpus_dense_embedding_ms"] = round(corpus_embedding_ms, 3)
-        metrics["corpus_embedding_source"] = corpus_embedding_source
+
+        metrics = evaluate(
+            final_rankings, _qrel_map(dataset["qrels"]), domain_allowed=domain_allowed,
+            file_allowed=file_allowed, shortlist=shortlists if options.strategy == "jev_post_rerank" else None,
+        )
+        metrics.update({"known_provider_cost_usd": ledger.known_cost, "navigation_warm_ms": round(navigation_warm_ms, 3),
+                        "corpus_dense_embedding_ms": round(corpus_embedding_ms, 3),
+                        "corpus_embedding_source": corpus_embedding_source})
         return write_run(options.run_root, options.run_id, manifest={
             "run_id": options.run_id, "strategy": options.strategy, "dataset_hash": dataset["dataset_hash"],
-            "query_ids": options.query_ids, "parameters": {
-                "bm25_top_k": options.candidate_k, "dense_top_k": options.candidate_k, "rrf_constant": options.rrf_constant,
-                "final_top_k": options.top_k, "route_threshold": options.route_threshold, "min_laws": options.min_laws, "max_laws": options.max_laws,
-            }, "route_info": route_info, "provider_cost_usd": ledger.known_cost, "corpus_embedding_source": corpus_embedding_source,
-            "corpus_embedding_cache_key": cache_key,
-            "jev_decision_cache_sources": jev_cache_sources,
+            "query_ids": options.query_ids,
+            "parameters": {"domain_initial_n": options.domain_initial_n, "choice_max_files": options.choice_max_files,
+                           "selected_files": options.selected_files, "bm25_top_k": options.candidate_k,
+                           "dense_top_k": options.candidate_k, "rrf_constant": options.rrf_constant,
+                           "post_shortlist_n": options.post_shortlist_n, "final_top_k": options.top_k,
+                           "navigation_model": options.navigation_model, "dense_backend": options.dense_backend,
+                           "dense_model": dense_model, "file_domains_path": str(options.file_domains_path)},
+            "provider_cost_usd": ledger.known_cost, "navigation_warm_ms": round(navigation_warm_ms, 3),
+            "corpus_embedding_source": corpus_embedding_source,
+            "corpus_embedding_cache_key": vector_cache_key, "jev_decision_cache_sources": cache_sources,
         }, rankings=rankings_rows, metrics=metrics, latency_cost=latency_rows, provider_ledger=ledger.entries)

@@ -15,17 +15,28 @@ def _per_query(ranking: list[str], relevant: set[str], k: int = 10) -> dict[str,
     return {"recall_at_10": recall, "ndcg_at_10": dcg / ideal if ideal else 0.0, "hit_at_1": float(bool(hits and hits[0]))}
 
 
-def evaluate(rankings: dict[str, list[str]], qrels: dict[str, set[str]], shortlist: dict[str, list[str]] | None = None, routed: dict[str, set[str]] | None = None) -> dict[str, Any]:
+def _retention(rankings: dict[str, list[str]], qrels: dict[str, set[str]], allowed: dict[str, set[str]]) -> tuple[float, float]:
+    fractions = [len(allowed.get(query_id, set()) & qrels.get(query_id, set())) / max(1, len(qrels.get(query_id, set()))) for query_id in rankings]
+    complete = [qrels.get(query_id, set()).issubset(allowed.get(query_id, set())) for query_id in rankings]
+    return sum(fractions) / max(1, len(fractions)), sum(complete) / max(1, len(complete))
+
+
+def evaluate(
+    rankings: dict[str, list[str]], qrels: dict[str, set[str]], *, shortlist: dict[str, list[str]] | None = None,
+    domain_allowed: dict[str, set[str]] | None = None, file_allowed: dict[str, set[str]] | None = None,
+) -> dict[str, Any]:
     per_query = {query_id: _per_query(ranking, qrels.get(query_id, set())) for query_id, ranking in rankings.items()}
     result: dict[str, Any] = {"query_count": len(per_query), "per_query": per_query}
     for metric in ("recall_at_10", "ndcg_at_10", "hit_at_1"):
         result[metric] = sum(row[metric] for row in per_query.values()) / max(1, len(per_query))
     if shortlist is not None:
-        result["shortlist_recall_at_10"] = sum(
+        result["shortlist_recall"] = sum(
             len(set(shortlist.get(query_id, [])) & qrels.get(query_id, set())) / max(1, len(qrels.get(query_id, set())))
             for query_id in rankings
         ) / max(1, len(rankings))
-    if routed is not None:
-        fractions = [len(routed.get(query_id, set()) & qrels.get(query_id, set())) / max(1, len(qrels.get(query_id, set()))) for query_id in rankings]
-        result["routing_retention"] = sum(fractions) / max(1, len(fractions))
+        result["shortlist_size"] = sum(len(shortlist.get(query_id, [])) for query_id in rankings) / max(1, len(rankings))
+    if domain_allowed is not None:
+        result["domain_retention"], result["domain_complete_retention"] = _retention(rankings, qrels, domain_allowed)
+    if file_allowed is not None:
+        result["file_retention"], result["file_complete_retention"] = _retention(rankings, qrels, file_allowed)
     return result

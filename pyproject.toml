@@ -11,6 +11,9 @@ requires-python = ">=3.11"
 [project.scripts]
 legal-stage-class = "legal_stage_class.cli:main"
 
+[project.optional-dependencies]
+navigation = ["torch", "transformers>=4.36"]
+
 [tool.setuptools.packages.find]
 where = ["src", "."]
 include = ["legal_stage_class*", "data", "data.processed"]

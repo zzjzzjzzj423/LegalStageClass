@@ -12,8 +12,8 @@ from typing import Any, Sequence
 from .util import digest, write_json
 
 
-CACHE_SCHEMA_VERSION = 1
-PRE_NOUL_INSTRUCTIONS = "该用户咨询是否与《{canonical_law_name}》相关？"
+CACHE_SCHEMA_VERSION = 2
+FILE_CHOICE_INSTRUCTIONS = "判断哪份法律文件最可能包含回答该用户咨询的适用条文。"
 POST_CHOICE_INSTRUCTIONS = "选择最能回答该用户咨询的法条。"
 
 
@@ -25,20 +25,16 @@ def _provider_identity() -> dict[str, str]:
     }
 
 
-def pre_route_cache_identity(query: str, laws: Sequence[dict[str, Any]], batch_size: int) -> tuple[str, dict[str, Any]]:
-    """Bind a cached Noul score to every input that can affect it."""
+def file_choice_cache_identity(query: str, laws: Sequence[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    """Bind file Choice probabilities to the complete, ordered file directory."""
     identity = {
         "schema_version": CACHE_SCHEMA_VERSION,
-        "kind": "jev_pre_noul_scores",
+        "kind": "jev_file_choice",
         **_provider_identity(),
         "query": query,
-        "law_catalog_hash": digest(list(laws)),
-        # A request contains one batch of questions; preserve its grouping as
-        # part of the decision input instead of assuming batch invariance.
-        "batch_size": batch_size,
-        "question_type": "noul",
-        "instructions": PRE_NOUL_INSTRUCTIONS,
-        "criteria": {"true": "该法律可能包含适用法条", "false": "该法律不太可能适用"},
+        "candidates": [{"law_id": law["law_id"], "canonical_law_name": law["canonical_law_name"]} for law in laws],
+        "question_type": "choice",
+        "instructions": FILE_CHOICE_INSTRUCTIONS,
     }
     return digest(identity), identity
 
@@ -94,22 +90,24 @@ class JevDecisionCache:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def load_pre_scores(self, cache_key: str, identity: dict[str, Any], law_ids: Sequence[str]) -> dict[str, float] | None:
+    def load_file_choice(self, cache_key: str, identity: dict[str, Any], law_ids: Sequence[str]) -> tuple[list[tuple[str, float]], dict[str, Any]] | None:
         value = self._load(cache_key, identity)
-        scores = value.get("scores") if value else None
-        if not isinstance(scores, dict) or set(scores) != set(law_ids):
+        ranking, metadata = (value.get("ranking"), value.get("metadata")) if value else (None, None)
+        if not isinstance(ranking, list) or not isinstance(metadata, dict):
             return None
         try:
-            parsed = {law_id: float(score) for law_id, score in scores.items()}
+            parsed = [(str(law_id), float(probability)) for law_id, probability in ranking]
         except (TypeError, ValueError):
             return None
-        if any(not 0 <= score <= 1 for score in parsed.values()):
+        if len(parsed) != len(law_ids) or {law_id for law_id, _ in parsed} != set(law_ids):
             return None
-        print(f"[cache] Jev PRE scores hit: {self._path(cache_key)}", file=sys.stderr, flush=True)
-        return parsed
+        if any(not 0 <= probability <= 1 for _, probability in parsed):
+            return None
+        print(f"[cache] Jev file Choice hit: {self._path(cache_key)}", file=sys.stderr, flush=True)
+        return parsed, metadata
 
-    def store_pre_scores(self, cache_key: str, identity: dict[str, Any], scores: dict[str, float]) -> None:
-        self._store(cache_key, identity, {"scores": scores}, "PRE scores")
+    def store_file_choice(self, cache_key: str, identity: dict[str, Any], ranking: Sequence[tuple[str, float]], metadata: dict[str, Any]) -> None:
+        self._store(cache_key, identity, {"ranking": list(ranking), "metadata": metadata}, "file Choice")
 
     def load_post_rerank(self, cache_key: str, identity: dict[str, Any], article_ids: Sequence[str]) -> tuple[list[tuple[str, float]], dict[str, Any]] | None:
         value = self._load(cache_key, identity)
