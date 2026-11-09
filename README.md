@@ -11,13 +11,13 @@ How do independent Jev interventions before and after hybrid legal retrieval aff
 ## Compared strategies
 
 1. **`baseline_hybrid`**
-   STARD query → BM25 Top-1000 + SiliconFlow BGE-M3 Dense Top-1000 → RRF → Top-10 articles.
+   Query → dynamic Top-4-domain directory (at most 255 files) → local title-similarity Top-2 files → BM25/local BGE Dense Top-1000 → RRF → Top-10 articles.
 
-2. **`jev_pre_route` - multi-law routing**
-   Jev selects one or more relevant laws before BM25 and dense retrieval search the corresponding article collections.
+2. **`jev_pre_route` - file Choice**
+   On the exact same domain-limited file directory, Jev Choice ranks all file IDs and titles; its top two files are then retrieved exactly as in the baseline.
 
-3. **`jev_post_rerank` - shortlist selection**
-   Jev receives the hybrid top-n shortlist, chooses the most relevant article, and uses option probabilities to rerank the shortlist.
+3. **`jev_post_rerank` - article Choice**
+   It reuses the baseline file selection and complete RRF ranking, sends its Top-20 articles to Jev Choice, and uses probabilities to form the final Top-10.
 
 Each strategy is evaluated independently on top of the same hybrid baseline rather than being stacked into one system.
 
@@ -33,8 +33,8 @@ Retrieval quality:
 - Recall@10
 - nDCG@10
 - Hit@1
-- Routing retention for PRE
-- Shortlist Recall@10 for POST
+- Domain and file-stage gold retention
+- Shortlist recall and actual shortlist size for POST
 
 Efficiency:
 
@@ -77,6 +77,14 @@ python -m pip install -e .
 legal-stage-class data prepare --raw-root data/raw/STARD
 ```
 
+The three experiment arms also require a local `BAAI/bge-small-zh-v1.5`
+checkpoint for domain and title navigation. Install its optional runtime and
+place the checkpoint in the local Hugging Face cache (the default is offline):
+
+```bash
+python -m pip install -e '.[navigation]'
+```
+
 The command writes only these normalized files under `data/processed/stard/<dataset_hash>/`: `queries.jsonl`, `corpus.jsonl`, `qrels.jsonl`, `splits.json`, and a mechanically derived `law_catalog.jsonl`. The catalog groups article names by the final `第X条` or `第X条之X` suffix.
 
 For the current upstream snapshot, preparation produces:
@@ -85,22 +93,17 @@ For the current upstream snapshot, preparation produces:
 data/processed/stard/d2bc0bf33155184c150c400cf1b29e03230e0dfc5c0a098dac5fdb3a59020482/
 ```
 
-Set `SILICONFLOW_API_KEY` for all arms and `TYPESAFE_API_KEY` for PRE/POST in the shell that runs the experiment. Dense retrieval always calls SiliconFlow `BAAI/bge-m3`; it does not fall back to local embeddings:
+The default Dense backend is the same local `BAAI/bge-small-zh-v1.5` model, so only PRE/POST need `TYPESAFE_API_KEY`. To reproduce the former remote BGE-M3 variant, add `--dense-backend siliconflow` and set `SILICONFLOW_API_KEY`:
 
 ```bash
-export SILICONFLOW_API_KEY='your-key'
 export TYPESAFE_API_KEY='your-key'
 ```
 
-The first live run embeds all 55,348 corpus articles. It reports batch progress and uses four concurrent SiliconFlow embedding requests by default. If the provider returns HTTP `429`, lower it before retrying:
-
-```bash
-export SILICONFLOW_EMBEDDING_CONCURRENCY=1
-```
+The first run embeds all 55,348 corpus articles locally and reports progress. This is a one-time local computation; its vectors are cached for later arms and runs.
 
 Corpus embeddings are stored locally under `.cache/legal-stage-class/` after the first successful build. The cache is ignored by Git and is never shared through the repository. A later `run` or `acceptance` command reuses it only when the dataset hash, full corpus text, SiliconFlow endpoint, model, encoding format, and input template all match. The three arms in one `acceptance` process also share the same in-memory vectors.
 
-Jev decisions use the same local cache root, under `.cache/legal-stage-class/jev/`. PRE stores the complete score set for all laws, while POST stores the probabilities for its exact Top-10 shortlist. A cached decision is reused only if the query, law catalog or candidate text, Jev endpoint/model, prompt contract, and (for PRE) batch size are unchanged. This lets you adjust PRE routing threshold or rerun the same experiment without asking Jev again. The cache holds provider outputs locally: do not commit or copy it into Git.
+Jev decisions use the same local cache root, under `.cache/legal-stage-class/jev/`. PRE caches probabilities for its exact domain-limited file directory; POST caches probabilities for its exact article shortlist. A cached decision is reused only if the query, candidate text, Jev endpoint/model, and prompt contract are unchanged. The cache holds provider outputs locally: do not commit or copy it into Git.
 
 Use a different local location if needed:
 
@@ -131,7 +134,7 @@ legal-stage-class acceptance \
   --query-ids 11,12,13
 ```
 
-Each arm writes only `manifest.json`, `rankings.jsonl`, `metrics.json`, `latency_cost.jsonl`, and `provider_ledger.jsonl` to `artifacts/runs/<run_id>/`. PRE rejects a run of more than ten queries when its ten-query calibration projects Jev reserved/estimated cost above the default `$20` ceiling. Set `TYPESAFE_JEV_RESERVED_USD_PER_JUDGMENT` or a provider token price variable before a paid run so the ledger uses your current pricing.
+Each arm writes only `manifest.json`, `rankings.jsonl`, `metrics.json`, `latency_cost.jsonl`, and `provider_ledger.jsonl` to `artifacts/runs/<run_id>/`. Set provider cost variables before a paid run so the ledger uses your current pricing.
 
 ## Implementation contract
 
@@ -139,9 +142,9 @@ The following behavior is shared across collaborators and should not change sile
 
 | Arm | Fixed behavior | Arm-specific behavior |
 | --- | --- | --- |
-| `baseline_hybrid` | BM25 Top-1000 + SiliconFlow `BAAI/bge-m3` Top-1000 → RRF (`k=60`) → Top-10 | None |
-| `jev_pre_route` | Same BM25, Dense, RRF, Top-10, metrics, and corpus vectors as baseline | Jev Noul scores all laws; `threshold`, `min_laws`, and `max_laws` select an article allow-list before retrieval |
-| `jev_post_rerank` | Same complete baseline Top-10 and common metrics | Jev Choice receives only that Top-10; option IDs are always `a_<article_id>` and probability order becomes the final ranking |
+| `baseline_hybrid` | Dynamic Top-4 domain directory, title-similarity Top-2 files, BM25 + local BGE Top-1000, RRF (`k=60`) | None |
+| `jev_pre_route` | Same domain directory, 255-file cap, file budget, retrieval, metrics, and corpus vectors | Jev Choice ranks the whole file directory by ID and title; probability Top-2 replaces title similarity |
+| `jev_post_rerank` | Same domain directory, title-selected files, and complete RRF ranking as baseline | Jev Choice reranks RRF Top-20 article ID/name/content options; probability order yields final Top-10 |
 
 PRE and POST are independent experimental arms. Never enable or combine them in one run. Dense retrieval must remain SiliconFlow `BAAI/bge-m3`; do not silently substitute a local embedding model.
 
@@ -161,9 +164,9 @@ PRE and POST are independent experimental arms. Never enable or combine them in 
 
 1. Keep the existing 3-query acceptance command as the first live smoke check after changes to retrieval, providers, metrics, or artifact writing.
 2. Add focused offline tests under `tests/` for every new parser, ranker, provider-response rule, cache identity change, or metric edge case. Run `PYTHONPATH=src python -m pytest` before committing.
-3. Use `tune_train` for threshold, route-breadth, or cost calibration. Do not use a reserved final split to choose those parameters.
-4. Before a run larger than ten PRE queries, record the ten-query cost calibration and stop when the projected cost exceeds the authorized budget. With the default reservation of `$0.00003` per law judgment, all 1,543 STARD queries project to about `$58.23`, above the default `$20` ceiling.
-5. Expand to wider `tune_train` baseline/POST evaluation only after the cache and 10-query PRE calibration behave as expected. Consider a final evaluation or additional research controls only after those results are reviewed.
+3. Use `tune_train` to confirm the Jev contracts and choose `post_shortlist_n`; do not use the reserved final split for that decision.
+4. Record live Jev input tokens, latency, and cost on a bounded development run before evaluating more queries.
+5. Expand to wider `tune_train` evaluation only after the cache and small live smoke check behave as expected.
 
 Do not commit `data/`, `artifacts/`, `.cache/`, API keys, or provider payloads. Commit source code, tests, configuration semantics, and documentation changes together so collaborators can reproduce the same behavior locally.
 

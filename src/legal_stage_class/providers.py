@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import ssl
 import sys
@@ -15,7 +16,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
-from .jev_cache import POST_CHOICE_INSTRUCTIONS, PRE_NOUL_INSTRUCTIONS
+from .jev_cache import FILE_CHOICE_INSTRUCTIONS, POST_CHOICE_INSTRUCTIONS
 from .util import env_float
 
 
@@ -54,19 +55,31 @@ def _post_json(endpoint: str, api_key: str, payload: dict[str, Any], timeout_sec
     tls12.maximum_version = ssl.TLSVersion.TLSv1_2
     # Some Anaconda/OpenSSL combinations receive a spurious TLS 1.3 EOF from
     # this endpoint. Retry only that transport failure with verified TLS 1.2.
+    last_error: BaseException | None = None
     for context in (None, tls12):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout_seconds, context=context) as response:
-                body = json.loads(response.read().decode("utf-8"))
-            return body, (time.perf_counter() - start) * 1000
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            raise RuntimeError(f"provider returned HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            if context is None and isinstance(exc.reason, ssl.SSLEOFError):
-                continue
-            raise RuntimeError(f"provider request failed: {exc.reason}") from exc
-    raise RuntimeError("provider request failed after verified TLS 1.2 retry")
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(request, timeout=timeout_seconds, context=context) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                return body, (time.perf_counter() - start) * 1000
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:500]
+                raise RuntimeError(f"provider returned HTTP {exc.code}: {detail}") from exc
+            except urllib.error.URLError as exc:
+                last_error = exc
+                if context is None and isinstance(exc.reason, ssl.SSLEOFError):
+                    break
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"provider request failed: {exc.reason}") from exc
+            except (http.client.RemoteDisconnected, ConnectionResetError, TimeoutError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                break
+    raise RuntimeError("provider closed the connection without a response after retries; check the provider endpoint, key, and network, then retry") from last_error
 
 
 class SiliconFlow:
@@ -140,36 +153,29 @@ class Jev:
             raise RuntimeError("Jev response has no answers object")
         return answers
 
-    def route_laws(self, query: str, laws: list[dict[str, Any]], batch_size: int = 32) -> dict[str, float]:
-        scores: dict[str, float] = {}
-        total_batches = max(1, (len(laws) + batch_size - 1) // batch_size)
-        report_every = max(1, total_batches // 10)
-        for offset in range(0, len(laws), batch_size):
-            batch = laws[offset : offset + batch_size]
-            questions = {
-                law["law_id"]: {
-                    "type": "noul",
-                    "instructions": PRE_NOUL_INSTRUCTIONS.format(canonical_law_name=law["canonical_law_name"]),
-                    "criteria": {"true": "该法律可能包含适用法条", "false": "该法律不太可能适用"},
-                }
-                for law in batch
-            }
-            answers = self._decide({"query": query}, questions, "jev_pre_noul")
-            for law in batch:
-                answer = answers.get(law["law_id"], {})
-                value = answer.get("noul") if isinstance(answer, dict) else None
-                if not isinstance(value, (int, float)) or not 0 <= value <= 1:
-                    raise RuntimeError(f"Jev Noul answer missing/invalid for {law['law_id']}")
-                scores[law["law_id"]] = float(value)
-            batch_number = offset // batch_size + 1
-            if batch_number == 1 or batch_number == total_batches or batch_number % report_every == 0:
-                print(
-                    f"[typesafe_jev] jev_pre_noul: {min(offset + len(batch), len(laws))}/{len(laws)} laws "
-                    f"({batch_number}/{total_batches} batches)",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        return scores
+    @staticmethod
+    def _choice_ranking(answer: Any, criteria: dict[str, str], prefix: str) -> list[tuple[str, float]]:
+        probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
+        if not isinstance(probabilities, dict) or set(probabilities) != set(criteria):
+            raise RuntimeError(f"Jev Choice response must provide a probability for every {prefix}<id> option")
+        ranking: list[tuple[str, float]] = []
+        for option_id, probability in probabilities.items():
+            if not isinstance(probability, (int, float)) or not 0 <= probability <= 1:
+                raise RuntimeError(f"invalid Jev Choice probability for {option_id}")
+            ranking.append((option_id.removeprefix(prefix), float(probability)))
+        return sorted(ranking, key=lambda pair: (-pair[1], pair[0]))
+
+    def choose_files(self, query: str, laws: list[dict[str, Any]]) -> tuple[list[tuple[str, float]], dict[str, Any]]:
+        if not laws or len(laws) > 255:
+            raise ValueError("Jev file Choice requires 1 to 255 files")
+        criteria = {f"f_{law['law_id']}": f"{law['law_id']}\n{law['canonical_law_name']}" for law in laws}
+        answers = self._decide(
+            {"query": query},
+            {"file_choice": {"type": "choice", "instructions": FILE_CHOICE_INSTRUCTIONS, "criteria": criteria}},
+            "jev_file_choice",
+        )
+        answer = answers.get("file_choice", {})
+        return self._choice_ranking(answer, criteria, "f_"), {"choice": answer.get("choice"), "confidence": answer.get("confidence")}
 
     def rerank(self, query: str, candidates: list[dict[str, str]]) -> tuple[list[tuple[str, float]], dict[str, Any]]:
         criteria = {f"a_{article['article_id']}": f"{article['name']}\n{article['content']}" for article in candidates}
@@ -179,12 +185,4 @@ class Jev:
             "jev_post_choice",
         )
         answer = answers.get("rerank", {})
-        probabilities = answer.get("probabilities") if isinstance(answer, dict) else None
-        if not isinstance(probabilities, dict) or set(probabilities) != set(criteria):
-            raise RuntimeError("Jev Choice response must provide a probability for every a_<article_id> option")
-        ranking = []
-        for option_id, probability in probabilities.items():
-            if not isinstance(probability, (int, float)) or not 0 <= probability <= 1:
-                raise RuntimeError(f"invalid Jev Choice probability for {option_id}")
-            ranking.append((option_id.removeprefix("a_"), float(probability)))
-        return sorted(ranking, key=lambda pair: (-pair[1], pair[0])), {"choice": answer.get("choice"), "confidence": answer.get("confidence")}
+        return self._choice_ranking(answer, criteria, "a_"), {"choice": answer.get("choice"), "confidence": answer.get("confidence")}

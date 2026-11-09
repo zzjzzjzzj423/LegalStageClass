@@ -15,13 +15,15 @@ from .util import digest, write_json
 CACHE_SCHEMA_VERSION = 1
 
 
-def corpus_cache_identity(dataset_hash: str, corpus: Sequence[dict[str, str]], *, endpoint: str, model: str) -> tuple[str, dict[str, Any]]:
+def corpus_cache_identity(
+    dataset_hash: str, corpus: Sequence[dict[str, str]], *, endpoint: str, model: str, provider: str = "siliconflow",
+) -> tuple[str, dict[str, Any]]:
     texts = [f"{article['name']}\n{article['content']}" for article in corpus]
     identity = {
         "schema_version": CACHE_SCHEMA_VERSION,
         "dataset_hash": dataset_hash,
         "corpus_text_hash": digest(texts),
-        "provider": "siliconflow",
+        "provider": provider,
         "endpoint": endpoint,
         "model": model,
         "encoding_format": "float",

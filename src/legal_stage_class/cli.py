@@ -34,11 +34,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--candidate-k", type=int, default=1000)
     run.add_argument("--top-k", type=int, default=10)
     run.add_argument("--rrf-constant", type=int, default=60)
-    run.add_argument("--route-threshold", type=float, default=0.5)
-    run.add_argument("--min-laws", type=int, default=1)
-    run.add_argument("--max-laws", type=int, default=20)
-    run.add_argument("--jev-batch-size", type=int, default=32)
-    run.add_argument("--pre-cost-ceiling-usd", type=float, default=20.0)
+    run.add_argument("--domain-initial-n", type=int, default=4)
+    run.add_argument("--choice-max-files", type=int, default=255)
+    run.add_argument("--selected-files", type=int, default=2)
+    run.add_argument("--post-shortlist-n", type=int, default=20)
+    run.add_argument("--dense-backend", choices=("local", "siliconflow"), default="local")
+    run.add_argument("--file-domains", type=Path, default=Path("data/processed/file_domains.jsonl"))
+    run.add_argument("--navigation-model", default="BAAI/bge-small-zh-v1.5")
     run.add_argument("--cache-root", type=Path, default=Path(".cache/legal-stage-class"))
     acceptance = commands.add_parser("acceptance", help="run baseline, PRE, and POST for exactly three live queries")
     acceptance.add_argument("--dataset", type=Path, required=True)
@@ -46,11 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance.add_argument("--run-root", type=Path, default=Path("artifacts/runs"))
     acceptance.add_argument("--run-prefix", default="acceptance")
     acceptance.add_argument("--candidate-k", type=int, default=1000)
-    acceptance.add_argument("--route-threshold", type=float, default=0.5)
-    acceptance.add_argument("--min-laws", type=int, default=1)
-    acceptance.add_argument("--max-laws", type=int, default=20)
-    acceptance.add_argument("--jev-batch-size", type=int, default=32)
-    acceptance.add_argument("--pre-cost-ceiling-usd", type=float, default=20.0)
+    acceptance.add_argument("--domain-initial-n", type=int, default=4)
+    acceptance.add_argument("--choice-max-files", type=int, default=255)
+    acceptance.add_argument("--selected-files", type=int, default=2)
+    acceptance.add_argument("--post-shortlist-n", type=int, default=20)
+    acceptance.add_argument("--dense-backend", choices=("local", "siliconflow"), default="local")
+    acceptance.add_argument("--file-domains", type=Path, default=Path("data/processed/file_domains.jsonl"))
+    acceptance.add_argument("--navigation-model", default="BAAI/bge-small-zh-v1.5")
     acceptance.add_argument("--cache-root", type=Path, default=Path(".cache/legal-stage-class"))
     return parser
 
@@ -70,9 +74,10 @@ def main(argv: list[str] | None = None) -> None:
             for strategy in ("baseline_hybrid", "jev_pre_route", "jev_post_rerank"):
                 destinations.append(runner.run(args.dataset, RunOptions(
                     strategy=strategy, query_ids=args.query_ids, run_id=f"{args.run_prefix}-{strategy}", run_root=args.run_root,
-                    candidate_k=args.candidate_k, route_threshold=args.route_threshold, min_laws=args.min_laws,
-                    max_laws=args.max_laws, jev_batch_size=args.jev_batch_size, pre_cost_ceiling_usd=args.pre_cost_ceiling_usd,
-                    cache_root=args.cache_root,
+                    candidate_k=args.candidate_k, domain_initial_n=args.domain_initial_n,
+                    choice_max_files=args.choice_max_files, selected_files=args.selected_files,
+                    post_shortlist_n=args.post_shortlist_n, dense_backend=args.dense_backend, file_domains_path=args.file_domains,
+                    navigation_model=args.navigation_model, cache_root=args.cache_root,
                 )))
             print(json.dumps({"runs": [str(path) for path in destinations]}, ensure_ascii=False))
             return
@@ -80,9 +85,9 @@ def main(argv: list[str] | None = None) -> None:
         destination = ExperimentRunner().run(args.dataset, RunOptions(
             strategy=args.strategy, query_ids=args.query_ids, run_id=run_id, run_root=args.run_root,
             candidate_k=args.candidate_k, top_k=args.top_k, rrf_constant=args.rrf_constant,
-            route_threshold=args.route_threshold, min_laws=args.min_laws, max_laws=args.max_laws,
-            jev_batch_size=args.jev_batch_size, pre_cost_ceiling_usd=args.pre_cost_ceiling_usd,
-            cache_root=args.cache_root,
+            domain_initial_n=args.domain_initial_n, choice_max_files=args.choice_max_files,
+            selected_files=args.selected_files, post_shortlist_n=args.post_shortlist_n,
+            dense_backend=args.dense_backend, file_domains_path=args.file_domains, navigation_model=args.navigation_model, cache_root=args.cache_root,
         ))
         print(json.dumps({"run": str(destination), "run_id": run_id}, ensure_ascii=False))
     except (ValueError, RuntimeError) as exc:
