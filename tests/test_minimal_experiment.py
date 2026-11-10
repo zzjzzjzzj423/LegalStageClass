@@ -1,6 +1,8 @@
 import json
+import os
 from pathlib import Path
 
+import legal_stage_class.cli as cli
 import legal_stage_class.experiment as experiment
 from data.processed.prepare_stard import prepare_stard
 from legal_stage_class.experiment import ExperimentRunner, RunOptions
@@ -52,7 +54,7 @@ class FakeJev:
     file_choice_calls = 0
     rerank_calls = 0
 
-    def __init__(self, ledger):
+    def __init__(self, ledger, **_kwargs):
         self.ledger = ledger
 
     def choose_files(self, _query, laws):
@@ -90,8 +92,21 @@ def _options(tmp_path, dataset, strategy, run_id, **kwargs):
     cache_root = kwargs.pop("cache_root", tmp_path / "cache")
     dense_backend = kwargs.pop("dense_backend", "siliconflow")
     return RunOptions(strategy=strategy, query_ids=["11", "12", "13"], run_id=run_id,
-                      run_root=tmp_path / "runs", candidate_k=3, cache_root=cache_root,
+                      run_root=tmp_path / "runs", cache_root=cache_root,
                       dense_backend=dense_backend, file_domains_path=_write_file_domains(tmp_path / "domains.jsonl", dataset), **kwargs)
+
+
+def test_cli_loads_jev_key_from_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("TYPESAFE_API_KEY=test-key\n", encoding="utf-8")
+
+    def run(_runner, _dataset, _options):
+        assert os.environ.get("TYPESAFE_API_KEY") == "test-key"
+        return tmp_path / "run"
+
+    monkeypatch.setattr(ExperimentRunner, "run", run)
+    cli.main(["run", "--dataset", "dataset", "--strategy", "jev_pre_route", "--query-ids", "11"])
 
 
 def test_prepare_derives_the_required_five_dataset_files(tmp_path):
@@ -103,6 +118,21 @@ def test_prepare_derives_the_required_five_dataset_files(tmp_path):
     assert [law["canonical_law_name"] for law in laws] == ["劳动法", "合同法"]
 
 
+def test_cli_runs_exactly_the_queries_in_a_fixed_set(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    query_set = tmp_path / "final.json"
+    query_set.write_text('{"query_ids":["13","11"]}', encoding="utf-8")
+    seen = []
+
+    def run(_runner, _dataset, options):
+        seen.extend(options.query_ids)
+        return tmp_path / "run"
+
+    monkeypatch.setattr(ExperimentRunner, "run", run)
+    cli.main(["run", "--dataset", "dataset", "--strategy", "baseline_hybrid", "--query-set", str(query_set)])
+    assert seen == ["13", "11"]
+
+
 def test_each_independent_arm_writes_only_the_five_run_artifacts(tmp_path, monkeypatch):
     raw = tmp_path / "raw"
     _write_raw(raw)
@@ -110,15 +140,54 @@ def test_each_independent_arm_writes_only_the_five_run_artifacts(tmp_path, monke
     monkeypatch.setattr(experiment, "SiliconFlow", FakeSiliconFlow)
     monkeypatch.setattr(experiment, "Jev", FakeJev)
     monkeypatch.setattr(experiment, "LocalBgeNavigator", FakeNavigator)
+    routes = []
+    shortlists = {}
     for strategy in ("baseline_hybrid", "jev_pre_route", "jev_post_rerank"):
-        destination = ExperimentRunner().run(dataset, _options(tmp_path, dataset, strategy, strategy))
+        options = _options(tmp_path, dataset, strategy, strategy, selected_files=1)
+        destination = ExperimentRunner().run(dataset, options)
         assert {path.name for path in destination.iterdir()} == {"manifest.json", "rankings.jsonl", "metrics.json", "latency_cost.jsonl", "provider_ledger.jsonl"}
         metrics = json.loads((destination / "metrics.json").read_text(encoding="utf-8"))
         assert {"recall_at_10", "ndcg_at_10", "hit_at_1"} <= metrics.keys()
+        latency = json.loads((destination / "latency_cost.jsonl").read_text(encoding="utf-8").splitlines()[0])
+        assert {"query_to_final_topk_ms", "domain_route_ms", "hybrid_retrieval_ms"} <= latency.keys()
+        assert ("file_selection_ms" in latency) == (strategy == "jev_pre_route")
+        assert ("post_rerank_ms" in latency) == (strategy == "jev_post_rerank")
+        rows = [json.loads(line) for line in (destination / "rankings.jsonl").read_text(encoding="utf-8").splitlines()]
+        routes.append([row["domain_route"] for row in rows])
+        shortlists[strategy] = [row["shortlist_article_ids"] for row in rows]
+        if strategy != "jev_pre_route":
+            assert all(row["allowed_article_count"] == 3 and "file_selection" not in row for row in rows)
+    assert routes[0] == routes[1] == routes[2]
+    assert shortlists["baseline_hybrid"] == shortlists["jev_post_rerank"]
     pre_metrics = json.loads((tmp_path / "runs" / "jev_pre_route" / "metrics.json").read_text(encoding="utf-8"))
     post_metrics = json.loads((tmp_path / "runs" / "jev_post_rerank" / "metrics.json").read_text(encoding="utf-8"))
     assert "file_retention" in pre_metrics
     assert post_metrics["shortlist_size"] == 3
+
+
+def test_pre_fuses_all_articles_in_the_two_selected_files(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    _write_raw(raw)
+    with (raw / "corpus.jsonl").open("a", encoding="utf-8") as corpus:
+        for article_id in range(4, 1003):
+            corpus.write(json.dumps({"id": article_id, "name": f"劳动法第{article_id}条", "content": "适用本法"}) + "\n")
+        corpus.write(json.dumps({"id": 1003, "name": "民法典第一条", "content": "制定本法"}) + "\n")
+    dataset = prepare_stard(raw, tmp_path / "processed")
+    monkeypatch.setattr(experiment, "Jev", FakeJev)
+    monkeypatch.setattr(experiment, "LocalBgeNavigator", FakeNavigator)
+    original_rrf = experiment.rrf
+    selected_article_ids = {str(article_id) for article_id in range(1, 1003)}
+
+    def check_rrf_inputs(rankings, k, constant):
+        for ranking in rankings:
+            assert {article_id for article_id, _ in ranking} == selected_article_ids
+        return original_rrf(rankings, k, constant)
+
+    monkeypatch.setattr(experiment, "rrf", check_rrf_inputs)
+    options = _options(tmp_path, dataset, "jev_pre_route", "pre-full", dense_backend="local")
+    destination = ExperimentRunner().run(dataset, options)
+    rows = [json.loads(line) for line in (destination / "rankings.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert all(len(row["ranking"]) == 10 for row in rows)
 
 
 def test_one_acceptance_process_reuses_corpus_embeddings(tmp_path, monkeypatch):
@@ -170,19 +239,29 @@ def test_local_dense_backend_never_constructs_siliconflow(tmp_path, monkeypatch)
     assert manifest["parameters"]["dense_backend"] == "local"
 
 
-def test_domain_route_keeps_the_largest_prefix_that_fits_the_file_cap():
+def test_domain_route_trims_only_new_files_in_the_boundary_domain():
     navigator = object.__new__(LocalBgeNavigator)
     navigator.laws = [
         {"law_id": "a", "domain_ids": ["D01"], "article_ids": ["1"]},
-        {"law_id": "b", "domain_ids": ["D01"], "article_ids": ["2"]},
+        {"law_id": "b", "domain_ids": ["D01", "D02"], "article_ids": ["2"]},
         {"law_id": "c", "domain_ids": ["D02"], "article_ids": ["3"]},
-        {"law_id": "d", "domain_ids": ["D03"], "article_ids": ["4"]},
+        {"law_id": "d", "domain_ids": ["D02"], "article_ids": ["4"]},
+        {"law_id": "e", "domain_ids": ["D03"], "article_ids": ["5"]},
     ]
     navigator._domain_text = {"D01": "one", "D02": "two", "D03": "three"}
     navigator._rank = lambda _query, _pairs: [("D01", 0.9), ("D02", 0.8), ("D03", 0.7)]
+
+    def rank_boundary_titles(query, laws):
+        assert query == "q"
+        assert [law["law_id"] for law in laws] == ["c", "d"]
+        return [("d", 0.9), ("c", 0.4)]
+
+    navigator.rank_titles = rank_boundary_titles
+    assert navigator.select_domains("q", initial_n=1, max_files=3)["candidate_law_ids"] == ["a", "b"]
     route = navigator.select_domains("q", initial_n=3, max_files=3)
     assert route["selected_domain_ids"] == ["D01", "D02"]
     assert route["file_count"] == 3
+    assert route["candidate_law_ids"] == ["a", "b", "d"]
 
 
 def test_fresh_runner_reuses_complete_jev_pre_and_post_decisions(tmp_path, monkeypatch):

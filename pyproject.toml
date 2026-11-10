@@ -7,6 +7,7 @@ name = "legal-stage-class"
 version = "0.1.0"
 description = "Minimal live experiments for Chinese statute retrieval"
 requires-python = ">=3.11"
+dependencies = ["python-dotenv>=1"]
 
 [project.scripts]
 legal-stage-class = "legal_stage_class.cli:main"

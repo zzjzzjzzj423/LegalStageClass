@@ -6,6 +6,8 @@ import sys
 import uuid
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from data.processed.prepare_stard import prepare_stard
 from .experiment import ExperimentRunner, RunOptions
 
@@ -15,6 +17,19 @@ def _query_ids(value: str) -> list[str]:
     if not result:
         raise argparse.ArgumentTypeError("provide at least one comma-separated query id")
     return result
+
+
+def _query_set(value: str) -> list[str]:
+    try:
+        config = json.loads(Path(value).read_text(encoding="utf-8"))
+        ids = config["query_ids"]
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise argparse.ArgumentTypeError(f"cannot read query_ids from {value}") from exc
+    if not isinstance(ids, list) or not ids or any(not isinstance(item, str) or not item.strip() for item in ids):
+        raise argparse.ArgumentTypeError(f"{value}: query_ids must be a non-empty list of strings")
+    if len(set(ids)) != len(ids):
+        raise argparse.ArgumentTypeError(f"{value}: duplicate query IDs")
+    return ids
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,16 +43,17 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="run exactly one independent experiment arm")
     run.add_argument("--dataset", type=Path, required=True)
     run.add_argument("--strategy", choices=("baseline_hybrid", "jev_pre_route", "jev_post_rerank"), required=True)
-    run.add_argument("--query-ids", type=_query_ids, required=True, help="exact comma-separated bounded query set")
+    queries = run.add_mutually_exclusive_group(required=True)
+    queries.add_argument("--query-ids", type=_query_ids, help="exact comma-separated bounded query set")
+    queries.add_argument("--query-set", dest="query_ids", type=_query_set, help="JSON file with an ordered query_ids list")
     run.add_argument("--run-id", default=None)
     run.add_argument("--run-root", type=Path, default=Path("artifacts/runs"))
-    run.add_argument("--candidate-k", type=int, default=1000)
     run.add_argument("--top-k", type=int, default=10)
     run.add_argument("--rrf-constant", type=int, default=60)
     run.add_argument("--domain-initial-n", type=int, default=4)
     run.add_argument("--choice-max-files", type=int, default=255)
-    run.add_argument("--selected-files", type=int, default=2)
-    run.add_argument("--post-shortlist-n", type=int, default=20)
+    run.add_argument("--selected-files", type=int, default=2, help="file count for Jev PRE")
+    run.add_argument("--post-shortlist-n", type=int, default=30)
     run.add_argument("--dense-backend", choices=("local", "siliconflow"), default="local")
     run.add_argument("--file-domains", type=Path, default=Path("data/processed/file_domains.jsonl"))
     run.add_argument("--navigation-model", default="BAAI/bge-small-zh-v1.5")
@@ -47,11 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance.add_argument("--query-ids", type=_query_ids, required=True)
     acceptance.add_argument("--run-root", type=Path, default=Path("artifacts/runs"))
     acceptance.add_argument("--run-prefix", default="acceptance")
-    acceptance.add_argument("--candidate-k", type=int, default=1000)
     acceptance.add_argument("--domain-initial-n", type=int, default=4)
     acceptance.add_argument("--choice-max-files", type=int, default=255)
     acceptance.add_argument("--selected-files", type=int, default=2)
-    acceptance.add_argument("--post-shortlist-n", type=int, default=20)
+    acceptance.add_argument("--post-shortlist-n", type=int, default=30)
     acceptance.add_argument("--dense-backend", choices=("local", "siliconflow"), default="local")
     acceptance.add_argument("--file-domains", type=Path, default=Path("data/processed/file_domains.jsonl"))
     acceptance.add_argument("--navigation-model", default="BAAI/bge-small-zh-v1.5")
@@ -66,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
             destination = prepare_stard(args.raw_root, args.output_root)
             print(json.dumps({"dataset": str(destination), "dataset_hash": destination.name}, ensure_ascii=False))
             return
+        load_dotenv(dotenv_path=Path(".env"), encoding="utf-8-sig", override=False)
         if args.command == "acceptance":
             if len(args.query_ids) != 3:
                 raise ValueError("acceptance requires exactly three fixed query ids")
@@ -74,7 +90,7 @@ def main(argv: list[str] | None = None) -> None:
             for strategy in ("baseline_hybrid", "jev_pre_route", "jev_post_rerank"):
                 destinations.append(runner.run(args.dataset, RunOptions(
                     strategy=strategy, query_ids=args.query_ids, run_id=f"{args.run_prefix}-{strategy}", run_root=args.run_root,
-                    candidate_k=args.candidate_k, domain_initial_n=args.domain_initial_n,
+                    domain_initial_n=args.domain_initial_n,
                     choice_max_files=args.choice_max_files, selected_files=args.selected_files,
                     post_shortlist_n=args.post_shortlist_n, dense_backend=args.dense_backend, file_domains_path=args.file_domains,
                     navigation_model=args.navigation_model, cache_root=args.cache_root,
@@ -84,7 +100,7 @@ def main(argv: list[str] | None = None) -> None:
         run_id = args.run_id or f"{args.strategy}-{uuid.uuid4().hex[:12]}"
         destination = ExperimentRunner().run(args.dataset, RunOptions(
             strategy=args.strategy, query_ids=args.query_ids, run_id=run_id, run_root=args.run_root,
-            candidate_k=args.candidate_k, top_k=args.top_k, rrf_constant=args.rrf_constant,
+            top_k=args.top_k, rrf_constant=args.rrf_constant,
             domain_initial_n=args.domain_initial_n, choice_max_files=args.choice_max_files,
             selected_files=args.selected_files, post_shortlist_n=args.post_shortlist_n,
             dense_backend=args.dense_backend, file_domains_path=args.file_domains, navigation_model=args.navigation_model, cache_root=args.cache_root,

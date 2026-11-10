@@ -10,20 +10,22 @@ How do independent Jev interventions before and after hybrid legal retrieval aff
 
 ## Compared strategies
 
+All three strategies build the same file directory from the four highest-ranked domains. They deduplicate by file ID and keep higher-ranked domains first. If a domain would exceed the 255-file budget, local BGE ranks only that domain's new file titles against the query and fills the remaining slots.
+
 1. **`baseline_hybrid`**
-   Query → dynamic Top-4-domain directory (at most 255 files) → local title-similarity Top-2 files → BM25/local BGE Dense Top-1000 → RRF → Top-10 articles.
+   Rank all articles in the directory with BM25 and local BGE Dense, fuse the complete rankings with RRF, and return the top ten.
 
 2. **`jev_pre_route` - file Choice**
-   On the exact same domain-limited file directory, Jev Choice ranks all file IDs and titles; its top two files are then retrieved exactly as in the baseline.
+   Jev Choice ranks the directory's file IDs and titles. Rank all articles in its top two files with BM25 and Dense, fuse the complete rankings with RRF, and return the top ten.
 
 3. **`jev_post_rerank` - article Choice**
-   It reuses the baseline file selection and complete RRF ranking, sends its Top-20 articles to Jev Choice, and uses probabilities to form the final Top-10.
+   Use the same RRF ranking as the baseline, send its top 30 articles to Jev Choice, and return the ten highest-probability articles.
 
 Each strategy is evaluated independently on top of the same hybrid baseline rather than being stacked into one system.
 
 ## Baselines and controls
 
-- BM25 + SiliconFlow BGE-M3 dense retrieval with reciprocal rank fusion
+- BM25 + local BGE dense retrieval with reciprocal rank fusion by default
 - PRE and POST are separate arms and are never stacked
 
 ## Evaluation
@@ -93,11 +95,13 @@ For the current upstream snapshot, preparation produces:
 data/processed/stard/d2bc0bf33155184c150c400cf1b29e03230e0dfc5c0a098dac5fdb3a59020482/
 ```
 
-The default Dense backend is the same local `BAAI/bge-small-zh-v1.5` model, so only PRE/POST need `TYPESAFE_API_KEY`. To reproduce the former remote BGE-M3 variant, add `--dense-backend siliconflow` and set `SILICONFLOW_API_KEY`:
+Run `run` and `acceptance` from the repository root so the CLI reads its Git-ignored `.env` file. Add your Jev key there for PRE/POST. Values already set in the process environment take precedence.
 
-```bash
-export TYPESAFE_API_KEY='your-key'
+```dotenv
+TYPESAFE_API_KEY=your-key
 ```
+
+For the BGE-M3 experiment, pass `--dense-backend local --navigation-model models/bge-m3` to every arm. This local model is used for domain navigation, file-title similarity, and Dense article retrieval. The local checkpoints are stored under `models/bge-m3` (BAAI revision `5617a9f61b028005a4858fdac845db406aefb181`) and `models/bge-small-zh-v1.5` (BAAI revision `7999e1d3359715c523056ef9478215996d62a620`). Use `--navigation-model models/bge-small-zh-v1.5` to select the latter explicitly. The CLI default remains `BAAI/bge-small-zh-v1.5`. To reproduce the remote BGE-M3 variant, use `--dense-backend siliconflow` and set `SILICONFLOW_API_KEY`.
 
 The first run embeds all 55,348 corpus articles locally and reports progress. This is a one-time local computation; its vectors are cached for later arms and runs.
 
@@ -120,21 +124,28 @@ legal-stage-class run \
   --query-ids 11,12,13
 ```
 
-For the budget-bounded 600-query experiment, use the committed, stratified `tune_train` selection. It excludes the 309-query `final` split; its exact query IDs, seed, strata, and integrity hash are in `configs/stard_tune_train_600_v1.json`. On macOS, pass the list to the CLI with:
+For the BGE-M3 rerun, pass the same verified final question list to each of the three arms:
 
 ```bash
-QUERY_IDS="$(jq -r '.query_ids | join(",")' configs/stard_tune_train_600_v1.json)"
+legal-stage-class run \
+  --dataset data/processed/stard/<dataset_hash> \
+  --strategy baseline_hybrid \
+  --query-set configs/stard_final_308_v6.json \
+  --dense-backend local --navigation-model models/bge-m3
 ```
 
-For the first live acceptance, use exactly three fixed query IDs. This runs baseline, then PRE, then POST:
+For PRE and POST, set `TYPESAFE_JEV_MODEL=jev-1.14.0` in `.env` to reproduce the reported model version.
+
+The historical 600-query development set overlaps this final list on 112 queries. For live acceptance, use three IDs outside the new final list. This runs baseline, then PRE, then POST:
 
 ```bash
 legal-stage-class acceptance \
   --dataset data/processed/stard/<dataset_hash> \
-  --query-ids 11,12,13
+  --query-ids 1023,591,683 \
+  --dense-backend local --navigation-model models/bge-m3
 ```
 
-Each arm writes only `manifest.json`, `rankings.jsonl`, `metrics.json`, `latency_cost.jsonl`, and `provider_ledger.jsonl` to `artifacts/runs/<run_id>/`. Set provider cost variables before a paid run so the ledger uses your current pricing.
+Each arm writes `manifest.json`, `rankings.jsonl`, `metrics.json`, `latency_cost.jsonl`, and `provider_ledger.jsonl` to `artifacts/runs/<run_id>/`. Jev requests from the project root share the persistent `artifacts/jev-budget.sqlite3` budget across arms, acceptance runs, and restarts. The $24 cap assumes the official TypeSafe endpoint, its standard context limit, and the $0.042 per million input token rate. Before each send, including transport retries, the CLI reserves the standard request ceiling. It reconciles against response input tokens and logs the per-call and cumulative estimates. Requests without usage retain their reservation. Cache hits make no paid call. Keep the database when resuming a run. The database tracks this project's Jev usage, and the account balance remains with TypeSafe.
 
 ## Implementation contract
 
@@ -142,11 +153,11 @@ The following behavior is shared across collaborators and should not change sile
 
 | Arm | Fixed behavior | Arm-specific behavior |
 | --- | --- | --- |
-| `baseline_hybrid` | Dynamic Top-4 domain directory, title-similarity Top-2 files, BM25 + local BGE Top-1000, RRF (`k=60`) | None |
-| `jev_pre_route` | Same domain directory, 255-file cap, file budget, retrieval, metrics, and corpus vectors | Jev Choice ranks the whole file directory by ID and title; probability Top-2 replaces title similarity |
-| `jev_post_rerank` | Same domain directory, title-selected files, and complete RRF ranking as baseline | Jev Choice reranks RRF Top-20 article ID/name/content options; probability order yields final Top-10 |
+| `baseline_hybrid` | Shared directory, complete BM25 and Dense rankings, RRF (`k=60`) | Returns the RRF top ten |
+| `jev_pre_route` | Shared directory, metrics, and corpus vectors | Jev Choice selects two files. Both retrievers contribute complete rankings of the selected files' articles to RRF |
+| `jev_post_rerank` | Same directory and RRF ranking as the baseline | Jev Choice reranks the top 30 article candidates and returns the top ten |
 
-PRE and POST are independent experimental arms. Never enable or combine them in one run. Dense retrieval must remain SiliconFlow `BAAI/bge-m3`; do not silently substitute a local embedding model.
+PRE and POST run as independent experimental arms. Use the same Dense backend for all arms in a comparison.
 
 ## Run-artifact contract
 
@@ -155,7 +166,7 @@ PRE and POST are independent experimental arms. Never enable or combine them in 
 | `manifest.json` | Dataset hash, query IDs, parameters, provider-cost summary, cache source/key | Confirm two runs used comparable inputs |
 | `rankings.jsonl` | One row per query: shortlist, final Top-10, ranks, PRE route or POST decision metadata | Recompute or inspect ranking changes |
 | `metrics.json` | Macro retrieval metrics and per-query values | Compare arms only on the same query set |
-| `latency_cost.jsonl` | Per-query `query_to_final_topk_ms`, optional POST increment, reserved/estimated cost | Separate online latency from corpus-index build time |
+| `latency_cost.jsonl` | Per-query end-to-end, domain routing, Hybrid retrieval, applicable PRE or POST stage times, and reserved/estimated cost | Separate online latency from model warm-up and index construction in `metrics.json` |
 | `provider_ledger.jsonl` | One row per remote provider request, usage, latency, request ID, cost status | Audit API volume and cost estimates |
 
 `cost_usd` is an estimate or reservation unless the provider supplies an authoritative billed amount. A value of `0` for SiliconFlow reflects the configured reservation, not proof that the provider charged nothing.
