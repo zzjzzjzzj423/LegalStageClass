@@ -86,18 +86,26 @@ class LocalBgeNavigator:
 
     def select_domains(self, query: str, initial_n: int, max_files: int) -> dict[str, Any]:
         ranked = self._rank(query, sorted(self._domain_text.items()))
-        selected = ranked[:initial_n]
-        while selected:
-            selected_ids = {domain_id for domain_id, _ in selected}
-            laws = [law for law in self.laws if selected_ids.intersection(law["domain_ids"])]
-            if len(laws) <= max_files:
-                return {
-                    "ranked_domains": [{"domain_id": domain_id, "similarity": score} for domain_id, score in ranked],
-                    "selected_domain_ids": [domain_id for domain_id, _ in selected],
-                    "file_count": len(laws), "candidate_law_ids": [law["law_id"] for law in laws], "laws": laws,
-                }
-            selected.pop()
-        raise RuntimeError(f"even the most similar domain contains more than {max_files} files")
+        selected_domains = []
+        selected_laws = set()
+        for domain_id, _ in ranked[:initial_n]:
+            new_laws = [law for law in self.laws
+                        if domain_id in law["domain_ids"] and law["law_id"] not in selected_laws]
+            remaining = max_files - len(selected_laws)
+            if len(new_laws) > remaining:
+                ranked_titles = self.rank_titles(query, new_laws)
+                selected_laws.update(law_id for law_id, _ in ranked_titles[:remaining])
+            else:
+                selected_laws.update(law["law_id"] for law in new_laws)
+            selected_domains.append(domain_id)
+            if len(selected_laws) == max_files:
+                break
+        laws = [law for law in self.laws if law["law_id"] in selected_laws]
+        return {
+            "ranked_domains": [{"domain_id": domain_id, "similarity": score} for domain_id, score in ranked],
+            "selected_domain_ids": selected_domains,
+            "file_count": len(laws), "candidate_law_ids": [law["law_id"] for law in laws], "laws": laws,
+        }
 
     def rank_titles(self, query: str, laws: list[dict[str, Any]]) -> list[tuple[str, float]]:
         return self._rank(query, [(law["law_id"], law["canonical_law_name"]) for law in laws])

@@ -14,8 +14,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any
+from typing import Any, Callable
 
+from .jev_budget import REQUEST_TOKEN_LIMIT, JevBudget, cost_usd
 from .jev_cache import FILE_CHOICE_INSTRUCTIONS, POST_CHOICE_INSTRUCTIONS
 from .util import env_float
 
@@ -42,7 +43,8 @@ class ProviderLedger:
         return sum(float(entry["cost_usd"] or 0.0) for entry in self.entries)
 
 
-def _post_json(endpoint: str, api_key: str, payload: dict[str, Any], timeout_seconds: float = 90) -> tuple[dict[str, Any], float]:
+def _post_json(endpoint: str, api_key: str, payload: dict[str, Any], timeout_seconds: float = 90,
+               *, before_attempt: Callable[[], None] | None = None) -> tuple[dict[str, Any], float]:
     request = urllib.request.Request(
         endpoint,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -58,6 +60,8 @@ def _post_json(endpoint: str, api_key: str, payload: dict[str, Any], timeout_sec
     last_error: BaseException | None = None
     for context in (None, tls12):
         for attempt in range(3):
+            if before_attempt is not None:
+                before_attempt()
             try:
                 with urllib.request.urlopen(request, timeout=timeout_seconds, context=context) as response:
                     body = json.loads(response.read().decode("utf-8"))
@@ -132,22 +136,48 @@ class SiliconFlow:
 
 
 class Jev:
-    def __init__(self, ledger: ProviderLedger):
+    def __init__(self, ledger: ProviderLedger, *, run_id: str, query_id: str):
         self.api_key = os.environ.get("TYPESAFE_API_KEY")
         if not self.api_key:
             raise RuntimeError("TYPESAFE_API_KEY is required for Jev experiments")
         self.endpoint = os.environ.get("TYPESAFE_JEV_URL", "https://api.typesafe.ai/v1/systemone")
         self.model = os.environ.get("TYPESAFE_JEV_MODEL", "jev-latest")
         self.ledger = ledger
+        self.run_id = run_id
+        self.query_id = query_id
+        self.budget = JevBudget()
 
     def _decide(self, state: dict[str, Any], questions: dict[str, Any], operation: str) -> dict[str, Any]:
-        response, elapsed = _post_json(self.endpoint, self.api_key, {"model": self.model, "state": state, "questions": questions})
-        self.ledger.add(
-            provider="typesafe_jev", operation=operation, elapsed_ms=elapsed,
-            usage=response.get("usage"), request_id=response.get("id") or response.get("request_id"),
-            cost_per_1k=env_float("TYPESAFE_JEV_COST_USD_PER_1K_TOKENS"),
-            reserved_cost_usd=env_float("TYPESAFE_JEV_RESERVED_USD_PER_JUDGMENT", 0.00003) * len(questions),
+        attempt_id = None
+
+        def reserve_attempt() -> None:
+            nonlocal attempt_id
+            attempt_id = self.budget.reserve(self.run_id, self.query_id, operation, self.model)
+
+        response, elapsed = _post_json(
+            self.endpoint, self.api_key, {"model": self.model, "state": state, "questions": questions},
+            before_attempt=reserve_attempt,
         )
+        usage = response.get("usage")
+        input_tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
+        if type(input_tokens) is not int or input_tokens < 0:
+            input_tokens = None
+        request_id = response.get("id") or response.get("request_id")
+        model = response.get("model") or self.model
+        confirmed, accounted = self.budget.settle(attempt_id, input_tokens, request_id, model)
+        status = "estimated_input_token_rate" if input_tokens is not None else "reserved"
+        cost = cost_usd(input_tokens if input_tokens is not None else REQUEST_TOKEN_LIMIT)
+        self.ledger.entries.append({
+            "event_id": str(uuid.uuid4()), "provider": "typesafe_jev", "operation": operation,
+            "elapsed_ms": round(elapsed, 3), "request_id": request_id, "usage": usage,
+            "query_id": self.query_id, "model": model, "cost_usd": cost, "cost_status": status,
+            "jev_confirmed_cost_usd": confirmed, "jev_accounted_cost_usd": accounted,
+        })
+        print(f"[jev] query={self.query_id} {operation}: USD {cost:.8f} ({status}), "
+              f"confirmed USD {confirmed:.6f}, including reservations USD {accounted:.6f} / 24",
+              file=sys.stderr, flush=True)
+        if input_tokens is not None and input_tokens > REQUEST_TOKEN_LIMIT:
+            raise RuntimeError("Jev usage exceeded the budgeted request context; verify the provider context limit")
         answers = response.get("answers")
         if not isinstance(answers, dict):
             raise RuntimeError("Jev response has no answers object")
