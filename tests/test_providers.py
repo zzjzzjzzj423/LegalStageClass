@@ -34,6 +34,34 @@ def test_post_json_retries_a_remote_disconnect(monkeypatch):
     assert len(calls) == 3
 
 
+def test_siliconflow_reranker_parses_scores_and_usage(monkeypatch):
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "test-key")
+    monkeypatch.setattr(
+        providers,
+        "_post_json",
+        lambda *_args, **_kwargs: ({
+            "id": "rerank-1",
+            "model": "Qwen/Qwen3-Reranker-8B",
+            "results": [
+                {"index": 1, "relevance_score": 0.9},
+                {"index": 0, "relevance_score": 0.2},
+            ],
+            "meta": {"tokens": {"input_tokens": 12, "output_tokens": 0}},
+        }, 3.5),
+    )
+    ledger = providers.ProviderLedger()
+    ranking, metadata = providers.SiliconFlowReranker(ledger).rerank(
+        "query",
+        [
+            {"article_id": "a", "name": "n1", "content": "c1"},
+            {"article_id": "b", "name": "n2", "content": "c2"},
+        ],
+    )
+    assert ranking == [("b", 0.9), ("a", 0.2)]
+    assert metadata["model"] == "Qwen/Qwen3-Reranker-8B"
+    assert ledger.entries[0]["usage"]["input_tokens"] == 12
+
+
 def test_jev_budget_survives_retries_and_blocks_the_next_attempt(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")

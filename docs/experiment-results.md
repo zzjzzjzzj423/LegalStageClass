@@ -51,6 +51,60 @@
 - 正式运行目录为 `artifacts/runs/bge-m3-v6-final-{baseline_hybrid,jev_pre_route,jev_post_rerank}/`，保留参数、逐题排名、质量、延迟和请求日志。
 - `artifacts/bge-m3-final-308-v6/summary.json` 保存阶段覆盖、逐题配对比较汇总、分组指标和案例题号。同目录保存建库记录、运行命令、日志和输入代码的 SHA-256。
 
+## Qwen3-Reranker-8B 独立后置重排（2026-11-10）
+
+### 链路定义
+
+该实验臂命名为 `cross_encoder_rerank`，与 Jev PRE/POST 独立，不叠加任何 Jev 判断：
+
+```text
+用户问题
+ → 本地 BGE-small 领域导航与目录裁剪
+ → BM25 + 本地 BGE-small Dense
+ → RRF（常数 60）
+ → 取 Top-30 条文候选
+ → SiliconFlow `Qwen/Qwen3-Reranker-8B` 重排
+ → 输出 Top-10 条文
+```
+
+初始检索与重排候选固定后，Qwen3-Reranker-8B 只负责对 Top-30 的“问题—法条名称—正文”进行相关性排序。结果写入内容寻址缓存，重复运行不会重复调用已经完成的候选重排。
+
+### 308 题结果
+
+- 评估题数：308
+- Dense/领域导航：本地 `BAAI/bge-small-zh-v1.5`
+- 重排模型：`Qwen/Qwen3-Reranker-8B`
+- 候选深度：30
+- 最终输出：Top-10
+- 运行目录：`artifacts/runs/cross_encoder_rerank-5b11df773366/`
+
+| 指标 | 结果 |
+| --- | ---: |
+| Recall@10 | **52.25%** |
+| nDCG@10 | **47.13%** |
+| Hit@1 | **44.16%** |
+| Shortlist Recall@30 | **53.11%** |
+| 平均 shortlist 大小 | 30.00 |
+| Domain Retention | 85.06% |
+| Domain Complete Retention | 83.44% |
+
+该链路的最终 Recall@10 与 Top-30 候选 Recall 只相差 0.86 个百分点，说明在当前候选集内，Qwen3-Reranker-8B 已经接近可达到的召回上限。下一步的主要收益应来自领域导航和 BM25/Dense 初始召回，而不是继续更换后置排序器。
+
+本次运行复用了语料向量缓存（`corpus_embedding_source=disk_cache`），本地模型预热约 8.35 秒，BM25 索引构建约 1.96 秒。`known_provider_cost_usd=0.0` 仅表示本次运行没有配置 reranker 的计费换算参数，不代表 SiliconFlow 必然免费；真实费用应结合 provider ledger 的 input token 和账户价格核对。
+
+该结果不能直接与上面的 BGE-M3 + Jev POST 结果做模型归因比较，因为两次运行的初始 Dense 后端不同：本实验使用本地 BGE-small，而正式 Jev 结果使用本地 BGE-M3。正式对照应先在相同 BGE-small 配置下运行 `baseline_hybrid`，再计算 `cross_encoder_rerank` 的逐题差异。
+
+可复现实验命令：
+
+```powershell
+python -m legal_stage_class run `
+  --dataset data\processed\stard\d2bc0bf33155184c150c400cf1b29e03230e0dfc5c0a098dac5fdb3a59020482 `
+  --strategy cross_encoder_rerank `
+  --query-set configs\stard_final_308_v6.json `
+  --dense-backend local `
+  --navigation-model BAAI/bge-small-zh-v1.5
+```
+
 ## 历史设置与结果
 
 本报告记录当前实现的可复现摘要；原始 `artifacts/`、模型缓存和 provider

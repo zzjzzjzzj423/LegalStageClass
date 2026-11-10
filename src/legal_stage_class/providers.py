@@ -135,6 +135,65 @@ class SiliconFlow:
         return [vector for vector in vectors if vector is not None]
 
 
+class SiliconFlowReranker:
+    """SiliconFlow text reranking adapter for an independent cross-encoder arm."""
+
+    def __init__(self, ledger: ProviderLedger):
+        self.api_key = os.environ.get("SILICONFLOW_API_KEY")
+        if not self.api_key:
+            raise RuntimeError("SILICONFLOW_API_KEY is required for cross-encoder reranking")
+        self.endpoint = os.environ.get("SILICONFLOW_RERANK_URL", "https://api.siliconflow.cn/v1/rerank")
+        self.model = os.environ.get("SILICONFLOW_RERANK_MODEL", "Qwen/Qwen3-Reranker-8B")
+        self.instruction = os.environ.get(
+            "SILICONFLOW_RERANK_INSTRUCTION",
+            "请根据用户问题判断每条法律条文的相关性，并按相关性从高到低排序。",
+        )
+        self.ledger = ledger
+
+    def rerank(self, query: str, candidates: list[dict[str, str]]) -> tuple[list[tuple[str, float]], dict[str, Any]]:
+        if not candidates:
+            raise ValueError("cross-encoder reranking requires at least one candidate")
+        payload = {
+            "model": self.model,
+            "query": query,
+            "documents": [f"{candidate['name']}\n{candidate['content']}" for candidate in candidates],
+            "instruction": self.instruction,
+            "top_n": len(candidates),
+            "return_documents": False,
+        }
+        response, elapsed = _post_json(self.endpoint, self.api_key, payload)
+        results = response.get("results")
+        if not isinstance(results, list) or len(results) != len(candidates):
+            raise RuntimeError("SiliconFlow rerank response must contain one result per candidate")
+        ranking: list[tuple[str, float]] = []
+        seen: set[int] = set()
+        for result in results:
+            if not isinstance(result, dict) or type(result.get("index")) is not int:
+                raise RuntimeError("SiliconFlow rerank response has an invalid result index")
+            index = result["index"]
+            score = result.get("relevance_score")
+            if index < 0 or index >= len(candidates) or index in seen or not isinstance(score, (int, float)):
+                raise RuntimeError("SiliconFlow rerank response has invalid indices or scores")
+            score = float(score)
+            if score != score or abs(score) == float("inf"):
+                raise RuntimeError("SiliconFlow rerank response has a non-finite score")
+            seen.add(index)
+            ranking.append((candidates[index]["article_id"], score))
+        self.ledger.add(
+            provider="siliconflow", operation="cross_encoder_rerank", elapsed_ms=elapsed,
+            usage=response.get("meta", {}).get("tokens") if isinstance(response.get("meta"), dict) else response.get("usage"),
+            request_id=response.get("id") or response.get("request_id"),
+            cost_per_1k=env_float("SILICONFLOW_RERANK_COST_USD_PER_1K_TOKENS"),
+            reserved_cost_usd=env_float("SILICONFLOW_RERANK_RESERVED_USD_PER_REQUEST", 0.0),
+        )
+        return ranking, {
+            "model": response.get("model") or self.model,
+            "endpoint": self.endpoint,
+            "instruction": self.instruction,
+            "result_count": len(ranking),
+        }
+
+
 class Jev:
     def __init__(self, ledger: ProviderLedger, *, run_id: str, query_id: str):
         self.api_key = os.environ.get("TYPESAFE_API_KEY")

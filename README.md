@@ -2,15 +2,15 @@
 
 **Where to Classify? Comparing Classification Before, During, and After Legal Retrieval**
 
-LegalStageClass is a small, runnable experiment for Chinese legal retrieval on STARD. It compares a shared hybrid baseline with two independent Jev interventions before and after retrieval.
+LegalStageClass is a small, runnable experiment for Chinese legal retrieval on STARD. It compares a shared hybrid baseline with independent pre-retrieval, post-retrieval, and cross-encoder reranking interventions.
 
 ## Research question
 
-How do independent Jev interventions before and after hybrid legal retrieval affect retrieval quality, latency, and API cost?
+How do independent interventions before and after hybrid legal retrieval affect retrieval quality, latency, and API cost?
 
 ## Compared strategies
 
-All three strategies build the same file directory from the four highest-ranked domains. They deduplicate by file ID and keep higher-ranked domains first. If a domain would exceed the 255-file budget, local BGE ranks only that domain's new file titles against the query and fills the remaining slots.
+All four strategies build the same file directory from the four highest-ranked domains. They deduplicate by file ID and keep higher-ranked domains first. If a domain would exceed the 255-file budget, local BGE ranks only that domain's new file titles against the query and fills the remaining slots.
 
 1. **`baseline_hybrid`**
    Rank all articles in the directory with BM25 and local BGE Dense, fuse the complete rankings with RRF, and return the top ten.
@@ -20,6 +20,9 @@ All three strategies build the same file directory from the four highest-ranked 
 
 3. **`jev_post_rerank` - article Choice**
    Use the same RRF ranking as the baseline, send its top 30 articles to Jev Choice, and return the ten highest-probability articles.
+
+4. **`cross_encoder_rerank` - Qwen3-Reranker-8B**
+   Use the same RRF ranking as the baseline, send its top 30 articles to SiliconFlow's `Qwen/Qwen3-Reranker-8B`, and return the ten highest-scoring articles.
 
 Each strategy is evaluated independently on top of the same hybrid baseline rather than being stacked into one system.
 
@@ -56,7 +59,9 @@ tests/                   Tests
 
 ## Minimal runnable experiment
 
-The implementation currently contains only three independent arms: `baseline_hybrid`, `jev_pre_route`, and `jev_post_rerank`. It does not implement concept tagging, a cross-encoder, validation/final locking, or an offline embedding model.
+The implementation contains four independent arms: `baseline_hybrid`, `jev_pre_route`, `jev_post_rerank`, and `cross_encoder_rerank`. The cross-encoder arm uses SiliconFlow's rerank API and defaults to `Qwen/Qwen3-Reranker-8B`. It does not implement concept tagging, validation/final locking, or an offline embedding model.
+
+The first 308-query `cross_encoder_rerank` run completed with Recall@10 52.25%, nDCG@10 47.13%, Hit@1 44.16%, and Top-30 shortlist recall 53.11%. This run used local `BAAI/bge-small-zh-v1.5` for initial navigation and Dense retrieval; see [the detailed result record](docs/experiment-results.md#qwen3-reranker-8b-独立后置重排2026-11-10) for the caveat on comparing it with the BGE-M3 + Jev results.
 
 ### Dataset setup for collaborators
 
@@ -79,7 +84,7 @@ python -m pip install -e .
 legal-stage-class data prepare --raw-root data/raw/STARD
 ```
 
-The three experiment arms also require a local `BAAI/bge-small-zh-v1.5`
+The retrieval arms require a local `BAAI/bge-small-zh-v1.5`
 checkpoint for domain and title navigation. Install its optional runtime and
 place the checkpoint in the local Hugging Face cache (the default is offline):
 
@@ -95,7 +100,9 @@ For the current upstream snapshot, preparation produces:
 data/processed/stard/d2bc0bf33155184c150c400cf1b29e03230e0dfc5c0a098dac5fdb3a59020482/
 ```
 
-Run `run` and `acceptance` from the repository root so the CLI reads its Git-ignored `.env` file. Add your Jev key there for PRE/POST. Values already set in the process environment take precedence.
+Run `run` and `acceptance` from the repository root so the CLI reads its Git-ignored `.env` file. Add your Jev key there for PRE/POST and your SiliconFlow key for the cross-encoder arm. Values already set in the process environment take precedence.
+
+The cross-encoder arm defaults to `Qwen/Qwen3-Reranker-8B` and uses `SILICONFLOW_RERANK_URL`, `SILICONFLOW_RERANK_MODEL`, and `SILICONFLOW_RERANK_INSTRUCTION` when set. Its provider cost fields can be configured with `SILICONFLOW_RERANK_COST_USD_PER_1K_TOKENS` or `SILICONFLOW_RERANK_RESERVED_USD_PER_REQUEST`.
 
 ```dotenv
 TYPESAFE_API_KEY=your-key
@@ -105,7 +112,7 @@ For the BGE-M3 experiment, pass `--dense-backend local --navigation-model models
 
 The first run embeds all 55,348 corpus articles locally and reports progress. This is a one-time local computation; its vectors are cached for later arms and runs.
 
-Corpus embeddings are stored locally under `.cache/legal-stage-class/` after the first successful build. The cache is ignored by Git and is never shared through the repository. A later `run` or `acceptance` command reuses it only when the dataset hash, full corpus text, SiliconFlow endpoint, model, encoding format, and input template all match. The three arms in one `acceptance` process also share the same in-memory vectors.
+Corpus embeddings are stored locally under `.cache/legal-stage-class/` after the first successful build. The cache is ignored by Git and is never shared through the repository. A later `run` or `acceptance` command reuses it only when the dataset hash, full corpus text, SiliconFlow endpoint, model, encoding format, and input template all match. The arms in one `acceptance` process also share the same in-memory vectors.
 
 Jev decisions use the same local cache root, under `.cache/legal-stage-class/jev/`. PRE caches probabilities for its exact domain-limited file directory; POST caches probabilities for its exact article shortlist. A cached decision is reused only if the query, candidate text, Jev endpoint/model, and prompt contract are unchanged. The cache holds provider outputs locally: do not commit or copy it into Git.
 
@@ -124,7 +131,7 @@ legal-stage-class run \
   --query-ids 11,12,13
 ```
 
-For the BGE-M3 rerun, pass the same verified final question list to each of the three arms:
+For the BGE-M3 rerun, pass the same verified final question list to each arm:
 
 ```bash
 legal-stage-class run \
@@ -145,6 +152,16 @@ legal-stage-class acceptance \
   --dense-backend local --navigation-model models/bge-m3
 ```
 
+Add `--include-cross-encoder` to include the independent SiliconFlow `Qwen/Qwen3-Reranker-8B` arm:
+
+```bash
+legal-stage-class acceptance \
+  --dataset data/processed/stard/<dataset_hash> \
+  --query-ids 1023,591,683 \
+  --dense-backend local --navigation-model models/bge-m3 \
+  --include-cross-encoder
+```
+
 Each arm writes `manifest.json`, `rankings.jsonl`, `metrics.json`, `latency_cost.jsonl`, and `provider_ledger.jsonl` to `artifacts/runs/<run_id>/`. Jev requests from the project root share the persistent `artifacts/jev-budget.sqlite3` budget across arms, acceptance runs, and restarts. The $24 cap assumes the official TypeSafe endpoint, its standard context limit, and the $0.042 per million input token rate. Before each send, including transport retries, the CLI reserves the standard request ceiling. It reconciles against response input tokens and logs the per-call and cumulative estimates. Requests without usage retain their reservation. Cache hits make no paid call. Keep the database when resuming a run. The database tracks this project's Jev usage, and the account balance remains with TypeSafe.
 
 ## Implementation contract
@@ -156,8 +173,9 @@ The following behavior is shared across collaborators and should not change sile
 | `baseline_hybrid` | Shared directory, complete BM25 and Dense rankings, RRF (`k=60`) | Returns the RRF top ten |
 | `jev_pre_route` | Shared directory, metrics, and corpus vectors | Jev Choice selects two files. Both retrievers contribute complete rankings of the selected files' articles to RRF |
 | `jev_post_rerank` | Same directory and RRF ranking as the baseline | Jev Choice reranks the top 30 article candidates and returns the top ten |
+| `cross_encoder_rerank` | Same directory and RRF ranking as the baseline | SiliconFlow `Qwen/Qwen3-Reranker-8B` reranks the top 30 article candidates and returns the top ten |
 
-PRE and POST run as independent experimental arms. Use the same Dense backend for all arms in a comparison.
+PRE, POST, and cross-encoder reranking run as independent experimental arms. Use the same Dense backend for all arms in a comparison.
 
 ## Run-artifact contract
 

@@ -42,7 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--output-root", type=Path, default=Path("data/processed/stard"))
     run = commands.add_parser("run", help="run exactly one independent experiment arm")
     run.add_argument("--dataset", type=Path, required=True)
-    run.add_argument("--strategy", choices=("baseline_hybrid", "jev_pre_route", "jev_post_rerank"), required=True)
+    run.add_argument(
+        "--strategy",
+        choices=("baseline_hybrid", "jev_pre_route", "jev_post_rerank", "cross_encoder_rerank"),
+        required=True,
+    )
     queries = run.add_mutually_exclusive_group(required=True)
     queries.add_argument("--query-ids", type=_query_ids, help="exact comma-separated bounded query set")
     queries.add_argument("--query-set", dest="query_ids", type=_query_set, help="JSON file with an ordered query_ids list")
@@ -67,6 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance.add_argument("--choice-max-files", type=int, default=255)
     acceptance.add_argument("--selected-files", type=int, default=2)
     acceptance.add_argument("--post-shortlist-n", type=int, default=30)
+    acceptance.add_argument(
+        "--include-cross-encoder",
+        action="store_true",
+        help="also run the SiliconFlow Qwen3-Reranker-8B arm",
+    )
     acceptance.add_argument("--dense-backend", choices=("local", "siliconflow"), default="local")
     acceptance.add_argument("--file-domains", type=Path, default=Path("data/processed/file_domains.jsonl"))
     acceptance.add_argument("--navigation-model", default="BAAI/bge-small-zh-v1.5")
@@ -87,7 +96,10 @@ def main(argv: list[str] | None = None) -> None:
                 raise ValueError("acceptance requires exactly three fixed query ids")
             destinations = []
             runner = ExperimentRunner()
-            for strategy in ("baseline_hybrid", "jev_pre_route", "jev_post_rerank"):
+            strategies = ["baseline_hybrid", "jev_pre_route", "jev_post_rerank"]
+            if args.include_cross_encoder:
+                strategies.append("cross_encoder_rerank")
+            for strategy in strategies:
                 destinations.append(runner.run(args.dataset, RunOptions(
                     strategy=strategy, query_ids=args.query_ids, run_id=f"{args.run_prefix}-{strategy}", run_root=args.run_root,
                     domain_initial_n=args.domain_initial_n,

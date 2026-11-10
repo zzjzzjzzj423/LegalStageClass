@@ -67,6 +67,27 @@ class FakeJev:
         return [(candidate["article_id"], 1.0 - index / 10) for index, candidate in enumerate(candidates)], {"choice": "a_1", "confidence": 0.9}
 
 
+class FakeCrossEncoder:
+    calls = 0
+    endpoint = "https://test.invalid/v1/rerank"
+    model = "Qwen/Qwen3-Reranker-8B"
+    instruction = "test instruction"
+
+    def __init__(self, ledger, **_kwargs):
+        self.ledger = ledger
+
+    def rerank(self, _query, candidates):
+        type(self).calls += 1
+        self.ledger.add(
+            provider="siliconflow", operation="cross_encoder_rerank", elapsed_ms=1,
+            usage={"input_tokens": len(candidates)}, request_id="rerank-test", cost_per_1k=0,
+        )
+        return [(candidate["article_id"], 1.0 - index / 10) for index, candidate in enumerate(candidates)], {
+            "model": self.model, "endpoint": self.endpoint, "instruction": self.instruction,
+            "result_count": len(candidates),
+        }
+
+
 class FakeNavigator:
     def __init__(self, _path, _model, laws):
         self.laws = laws
@@ -163,6 +184,30 @@ def test_each_independent_arm_writes_only_the_five_run_artifacts(tmp_path, monke
     post_metrics = json.loads((tmp_path / "runs" / "jev_post_rerank" / "metrics.json").read_text(encoding="utf-8"))
     assert "file_retention" in pre_metrics
     assert post_metrics["shortlist_size"] == 3
+
+
+def test_cross_encoder_rerank_is_an_independent_top30_arm(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    _write_raw(raw)
+    dataset = prepare_stard(raw, tmp_path / "processed")
+    FakeCrossEncoder.calls = 0
+    monkeypatch.setattr(experiment, "SiliconFlow", FakeSiliconFlow)
+    monkeypatch.setattr(experiment, "SiliconFlowReranker", FakeCrossEncoder)
+    monkeypatch.setattr(experiment, "LocalBgeNavigator", FakeNavigator)
+
+    destination = ExperimentRunner().run(
+        dataset,
+        _options(tmp_path, dataset, "cross_encoder_rerank", "cross", top_k=3, post_shortlist_n=3),
+    )
+    assert FakeCrossEncoder.calls == 3
+    metrics = json.loads((destination / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["shortlist_size"] == 3
+    rows = [json.loads(line) for line in (destination / "rankings.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert all("cross_encoder_rerank" in row for row in rows)
+    assert all("cross_encoder_rerank_ms" in json.loads(line) for line in (destination / "latency_cost.jsonl").read_text(encoding="utf-8").splitlines())
+    manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["parameters"]["rerank_model"] == "Qwen/Qwen3-Reranker-8B"
+    assert manifest["decision_cache_sources"]["cross_encoder_rerank"] == {"11": "live", "12": "live", "13": "live"}
 
 
 def test_pre_fuses_all_articles_in_the_two_selected_files(tmp_path, monkeypatch):

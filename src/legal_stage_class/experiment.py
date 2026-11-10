@@ -16,7 +16,8 @@ from .embedding_cache import EmbeddingCache, corpus_cache_identity
 from .jev_cache import JevDecisionCache, file_choice_cache_identity, post_rerank_cache_identity
 from .metrics import evaluate
 from .navigation import LocalBgeNavigator
-from .providers import Jev, ProviderLedger, SiliconFlow
+from .providers import Jev, ProviderLedger, SiliconFlow, SiliconFlowReranker
+from .rerank_cache import RerankDecisionCache, rerank_cache_identity
 from .retrieval import BM25, cosine_topk, rrf
 
 
@@ -66,17 +67,20 @@ class ExperimentRunner:
         return navigator
 
     def run(self, dataset_path: Path, options: RunOptions) -> Path:
-        if options.strategy not in {"baseline_hybrid", "jev_pre_route", "jev_post_rerank"}:
-            raise ValueError("strategy must be baseline_hybrid, jev_pre_route, or jev_post_rerank")
+        valid_strategies = {"baseline_hybrid", "jev_pre_route", "jev_post_rerank", "cross_encoder_rerank"}
+        if options.strategy not in valid_strategies:
+            raise ValueError(f"strategy must be one of: {', '.join(sorted(valid_strategies))}")
         is_pre = options.strategy == "jev_pre_route"
         is_post = options.strategy == "jev_post_rerank"
+        is_cross_encoder = options.strategy == "cross_encoder_rerank"
+        is_rerank = is_post or is_cross_encoder
         if options.domain_initial_n < 1 or options.choice_max_files < 1:
             raise ValueError("domain_initial_n and choice_max_files must be positive")
         if is_pre and options.selected_files < 1:
             raise ValueError("selected_files must be positive")
         if options.dense_backend not in {"local", "siliconflow"}:
             raise ValueError("dense_backend must be local or siliconflow")
-        if is_post and options.post_shortlist_n < options.top_k:
+        if is_rerank and options.post_shortlist_n < options.top_k:
             raise ValueError("post_shortlist_n must be at least top_k")
 
         dataset = load_dataset(dataset_path)
@@ -91,6 +95,7 @@ class ExperimentRunner:
         navigation_warm_ms = (time.perf_counter() - navigation_start) * 1000
         ledger = ProviderLedger()
         jev_cache = JevDecisionCache(options.cache_root)
+        rerank_cache = RerankDecisionCache(options.cache_root)
         article_by_id = {row["article_id"]: row for row in dataset["corpus"]}
 
         print(f"[run] {options.strategy}: {len(queries)} queries; loading shared indices", file=sys.stderr, flush=True)
@@ -103,6 +108,7 @@ class ExperimentRunner:
         else:
             dense_client = None
             dense_endpoint, dense_model, dense_provider = "local://transformers", options.navigation_model, "local_bge"
+        cross_encoder = SiliconFlowReranker(ledger) if is_cross_encoder else None
         vector_cache_key, vector_identity = corpus_cache_identity(
             dataset["dataset_hash"], dataset["corpus"], endpoint=dense_endpoint, model=dense_model, provider=dense_provider,
         )
@@ -131,7 +137,7 @@ class ExperimentRunner:
         domain_allowed: dict[str, set[str]] = {}
         file_allowed: dict[str, set[str]] = {}
         shortlists: dict[str, list[str]] = {}
-        cache_sources: dict[str, dict[str, str]] = {"file_choice": {}, "post_rerank": {}}
+        cache_sources: dict[str, dict[str, str]] = {"file_choice": {}, "post_rerank": {}, "cross_encoder_rerank": {}}
 
         for number, query in enumerate(queries, 1):
             query_id, text = query["query_id"], query["text"]
@@ -177,7 +183,7 @@ class ExperimentRunner:
             candidate_count = len(permitted)
             bm25_ranking = bm25.topk(text, candidate_count, permitted)
             dense_ranking = cosine_topk(query_vector, dataset["corpus"], corpus_vectors, candidate_count, permitted)
-            fusion_depth = options.post_shortlist_n if is_post else options.top_k
+            fusion_depth = options.post_shortlist_n if is_rerank else options.top_k
             fused = rrf([bm25_ranking, dense_ranking], fusion_depth, options.rrf_constant)
             shortlist = [article_id for article_id, _ in fused]
             shortlists[query_id] = shortlist
@@ -198,6 +204,28 @@ class ExperimentRunner:
                     cache_sources["post_rerank"][query_id] = "disk_cache"
                 final = reranked[: options.top_k]
                 stage_ms["post_rerank_ms"] = round((time.perf_counter() - retrieval_end) * 1000, 3)
+            elif is_cross_encoder:
+                if cross_encoder is None:
+                    raise RuntimeError("cross-encoder client was not initialized")
+                candidates = [article_by_id[article_id] for article_id in shortlist]
+                cross_cache_key, cross_identity = rerank_cache_identity(
+                    text,
+                    candidates,
+                    endpoint=cross_encoder.endpoint,
+                    model=cross_encoder.model,
+                    instruction=cross_encoder.instruction,
+                )
+                cached_cross = rerank_cache.load(cross_cache_key, cross_identity, shortlist)
+                if cached_cross is None:
+                    reranked, cross_metadata = cross_encoder.rerank(text, candidates)
+                    rerank_cache.store(cross_cache_key, cross_identity, reranked, cross_metadata)
+                    cache_sources["cross_encoder_rerank"][query_id] = "live"
+                else:
+                    reranked, cross_metadata = cached_cross
+                    cache_sources["cross_encoder_rerank"][query_id] = "disk_cache"
+                post_metadata = cross_metadata
+                final = reranked[: options.top_k]
+                stage_ms["cross_encoder_rerank_ms"] = round((time.perf_counter() - retrieval_end) * 1000, 3)
             else:
                 final = fused[: options.top_k]
 
@@ -220,6 +248,8 @@ class ExperimentRunner:
                 ranking_row["file_selection"] = file_selection
             if is_post:
                 ranking_row["post_rerank"] = post_metadata
+            if is_cross_encoder:
+                ranking_row["cross_encoder_rerank"] = post_metadata
             rankings_rows.append(ranking_row)
             latency_rows.append({
                 "query_id": query_id, "strategy": options.strategy,
@@ -231,7 +261,7 @@ class ExperimentRunner:
 
         metrics = evaluate(
             final_rankings, _qrel_map(dataset["qrels"]), domain_allowed=domain_allowed,
-            file_allowed=file_allowed if is_pre else None, shortlist=shortlists if is_post else None,
+            file_allowed=file_allowed if is_pre else None, shortlist=shortlists if is_rerank else None,
         )
         metrics.update({"known_provider_cost_usd": ledger.known_cost, "navigation_warm_ms": round(navigation_warm_ms, 3),
                         "bm25_index_ms": bm25_index_ms,
@@ -245,13 +275,22 @@ class ExperimentRunner:
         }
         if is_pre:
             parameters["selected_files"] = options.selected_files
-        if is_post:
+        if is_rerank:
             parameters["post_shortlist_n"] = options.post_shortlist_n
+        if is_cross_encoder and cross_encoder is not None:
+            parameters.update({
+                "rerank_provider": "siliconflow",
+                "rerank_endpoint": cross_encoder.endpoint,
+                "rerank_model": cross_encoder.model,
+                "rerank_instruction": cross_encoder.instruction,
+            })
         return write_run(options.run_root, options.run_id, manifest={
             "run_id": options.run_id, "strategy": options.strategy, "dataset_hash": dataset["dataset_hash"],
             "query_ids": options.query_ids,
             "parameters": parameters,
             "provider_cost_usd": ledger.known_cost, "navigation_warm_ms": round(navigation_warm_ms, 3),
             "corpus_embedding_source": corpus_embedding_source,
-            "corpus_embedding_cache_key": vector_cache_key, "jev_decision_cache_sources": cache_sources,
+            "corpus_embedding_cache_key": vector_cache_key,
+            "decision_cache_sources": cache_sources,
+            "jev_decision_cache_sources": cache_sources,
         }, rankings=rankings_rows, metrics=metrics, latency_cost=latency_rows, provider_ledger=ledger.entries)
